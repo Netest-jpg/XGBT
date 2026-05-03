@@ -5,7 +5,7 @@
 ---
 
 ## Table of Contents
-
+0. [Setup](#setup)
 1. [Project Overview](#1-project-overview)
 2. [Project Layout](#2-project-layout)
 3. [Quick Start](#3-quick-start)
@@ -20,6 +20,22 @@
 12. [Deep-Dive: Architecture and Design Decisions](#12-deep-dive-architecture-and-design-decisions)
 13. [Known Limitations](#13-known-limitations)
 
+---
+## Setup
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if you don't have it:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Then clone and install:
+
+```bash
+git clone https://github.com/Netest-jpg/XGBT.git
+cd XGBT
+uv sync --extra dev
+```
 ---
 
 ## 1. Project Overview
@@ -105,9 +121,9 @@ RUN_XGB_PROTOTYPE_SMOKE=1 uv run python -m pytest tests/test_smoke_training.py -
 
 ---
 
-## 4. Using This Template With a New CSV
+## 4. To use this template With a new CSV
 
-### Step 1 — Prepare your CSV
+### Step 0 — Prepare your CSV
 
 Your CSV should have one row per training example, one target column, any number of feature columns, and a header row with column names.
 
@@ -117,7 +133,7 @@ age,income,plan_type,tenure_months,churned
 52,105000,business,44,1
 ```
 
-### Step 2 — Put the CSV somewhere predictable
+### Step 1 — Put the CSV somewhere predictable
 
 Recommended layout:
 
@@ -129,15 +145,15 @@ my_project/
 └── xgb_prototype/
 ```
 
-### Step 3 — Edit the three required config values in `config.yaml`
+### Step 2 — Edit the three required config values in `config.yaml`
 
 ```yaml
 task: classification        # or regression
-target_col: your_target
-data_path: data/my_new_dataset.csv
+target_col: your_target       # the column you want to predict
+data_path: data/my_new_dataset.csv        # path to your csv
 ```
 
-### Step 4 — Run a fast draft first
+### Step 3 — Run a fast draft first
 
 Confirm the dataset loads and the pipeline trains before tuning:
 
@@ -153,7 +169,7 @@ diagnostics:
 python train.py
 ```
 
-### Step 5 — Move to a better run
+### Step 4 — Move to a better run
 
 ```yaml
 cv_folds: 5
@@ -1019,3 +1035,4 @@ Soft fallback: if `use_gpu: true` but no GPU is detected, training falls back to
 - Add tests for new config keys, metrics, threshold policies, and serving behavior.
 - Generated directories (`models/`, `plots/`, `.pytest_cache/`, `__pycache__/`) are not source code.
 - The package should stay general-purpose. If a change only applies to one dataset, prefer a config option or validation rule over hard-coding it.
+- Claude Sonnet 4.6 & GPT 5.5 high has assisted in building this project
