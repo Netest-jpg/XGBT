@@ -1,0 +1,118 @@
+# ── Task ──────────────────────────────────────
+task: classification        # "classification" | "regression"
+target_col: Class
+test_size: 0.2
+random_state: 42
+
+# ── Paths ─────────────────────────────────────
+model_output_dir: models    # timestamped artifacts saved here
+plot_output_dir: plots      # HTML + PNG plots saved here
+
+# ── Data loading (UPGRADE 15) ─────────────────
+# Supports .csv, .parquet, .json, .jsonl, .xlsx
+# Also supports glob patterns: "data/batch_*.csv"
+data_path: creditcard.csv
+csv_chunk_size: null        # null = normal read; int = stream CSV in row chunks with progress logs
+csv_chunk_log_every: 10     # log every N CSV chunks when chunked loading is enabled
+
+# ── Logging ───────────────────────────────────
+log_level: INFO             # DEBUG | INFO | WARNING | ERROR
+log_file: null              # null = stdout only; or "train.log"
+
+# ── Cross-validation ──────────────────────────
+cv_folds: 5                 # 0 = single-split fast path
+cv_strategy: stratified     # "stratified" | "timeseries"
+
+# ── Optuna ────────────────────────────────────
+n_trials: 30
+optuna_timeout: null        # seconds; null = run all n_trials
+search_subsample: 0.6
+n_estimators_max: 300
+early_stop_rnds: 20
+
+# ── PCA ───────────────────────────────────────
+pca_threshold: 10
+pca_variance: 0.95
+pca_max_components: null
+
+# ── Imbalance ─────────────────────────────────
+imbalance_threshold: 0.15
+
+# ── Feature inference ─────────────────────────
+cardinality_limit: 20       # int cols with ≤ N unique vals → categorical
+
+# ── Wide hyperparameter search ────────────────
+wide_search: false          # true → broader ranges + more trials
+
+# ── Drift detection (UPGRADE 12) ──────────────
+drift_alpha: 0.05           # p-value threshold; feature flagged if p < alpha
+drift_warn_only: true       # false → raise ValueError on any drift detected
+
+# ── Feature selection (UPGRADE 23) ────────────
+feature_selection: false    # true → RFECV before Optuna; drops low-value features
+
+# ── Target encoding (UPGRADE 24) ──────────────
+target_encoding_threshold: 50  # object cols with > N unique vals → TargetEncoder (not OHE)
+
+# ── MLflow experiment tracking (UPGRADE 25) ───
+mlflow_tracking_uri: null   # e.g. "http://localhost:5000"; null = disabled
+mlflow_experiment: xgb_prototype
+
+# ── Outlier detection (UPGRADE 28) ────────────
+outlier_contamination: 0.05 # IsolationForest expected outlier fraction
+
+# ── Partial dependence plots (UPGRADE 29) ─────
+pdp_top_n: 5                # top-N features by XGBoost gain to plot PDP+ICE
+
+# ── Regression log-transform (UPGRADE 30) ─────
+target_log_transform: false # true → log1p(y) for regression (requires y > 0)
+
+# ── Runtime acceleration / validation ─────────
+use_gpu: false              # true → use CUDA when available, otherwise CPU fallback
+pandera_validation: true    # true → infer and run Pandera schema checks
+callback_log_period: 50     # log XGBoost progress every N boosting rounds
+variance_threshold: 0.0     # drop numerical columns at/below this variance before RFECV
+interaction_top_k: 10       # max correlated numerical feature pairs to expand
+calibration_enabled: true   # calibrate classifiers on validation predictions
+
+# ── Objective selection ───────────────────────
+metric: auto                # auto | roc_auc | auprc | macro_f1 | weighted_f1 | r2
+
+# ── Threshold policy (binary classification) ──
+threshold_policy:
+  mode: auto                # auto | f1 | fbeta | precision_at_recall | recall_at_precision | disabled
+  beta: 1.0                 # used when mode=fbeta
+  min_precision: 0.80       # used when mode=recall_at_precision
+  min_recall: 0.80          # used when mode=precision_at_recall
+  n_quantiles: 200          # candidate thresholds from probability quantiles
+
+# ── Baseline comparison ───────────────────────
+baselines:
+  enabled: true
+  include_dummy: true       # DummyClassifier / DummyRegressor
+  include_linear: true      # LogisticRegression for classification
+  include_default_xgb: true # non-tuned XGBoost reference model
+
+# ── Top-K Optuna ensemble ─────────────────────
+ensemble:
+  enabled: false            # true → fit/store a soft-voting ensemble from top Optuna trials
+  top_k: 3                  # number of completed Optuna trials to ensemble
+
+# ── Diagnostics / plots ───────────────────────
+diagnostics:
+  plots_enabled: true
+  optuna_plots: true
+  learning_curve: true
+  permutation_importance: true
+  threshold_sweep: true
+  outlier_report: true
+  partial_dependence: true
+  pca_plots: true
+
+# ── Continuous drift monitoring ───────────────
+drift_monitor:
+  enabled: true
+  persistence: 3            # alert only after drift persists for N consecutive checks
+  min_feature_drift_ratio: 0.10
+  retrain_feature_ratio: 0.25
+  retrain_severity: high    # none | low | medium | high
