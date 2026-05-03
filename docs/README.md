@@ -85,7 +85,7 @@ Install or sync the project environment:
 uv sync --extra dev
 ```
 
-Run training with the backward-compatible launcher:
+Run training:
 
 ```bash
 python train.py
