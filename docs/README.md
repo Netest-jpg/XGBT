@@ -104,7 +104,7 @@ uv sync --extra dev
 Run training:
 
 ```bash
-python train.py
+uv run python train.py
 ```
 
 Run the fast tests:
@@ -166,7 +166,7 @@ diagnostics:
 ```
 
 ```bash
-python train.py
+uv run python train.py
 ```
 
 ### Step 4 — Move to a better run
@@ -523,7 +523,7 @@ n_trials: 50
 
 Run command:
 ```bash
-python train.py
+uv run python train.py
 ```
 
 Both run the same `main()` function in `xgb_prototype/train.py`. The root `train.py` is a thin launcher for backward compatibility.
