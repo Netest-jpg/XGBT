@@ -4,7 +4,7 @@ from __future__ import annotations
 import importlib.metadata
 import logging
 from typing import Any
-
+from tqdm import tqdm
 import joblib
 import numpy as np
 import optuna
@@ -285,8 +285,22 @@ def tune_hyperparameters(
              "metric=%s · cv=%s · wide=%s)...",
              N_TRIALS, _timeout_label, SEARCH_SUBSAMPLE * 100,
              metric.name, CV_FOLDS if use_cv else "off", WIDE_SEARCH)
-    study.optimize(objective, n_trials=N_TRIALS, timeout=OPTUNA_TIMEOUT,
-                   n_jobs=1, show_progress_bar=True)
+    with tqdm(total=N_TRIALS, ncols=100, desc="Optuna search") as pbar:
+        def _objective_with_progress(trial):
+            result = objective(trial)
+            completed = [t for t in study.trials if t.value is not None]
+            best = max(t.value for t in completed) if completed else float("nan")
+            pbar.set_postfix(best=f"{best:.6f}", trial=trial.number)
+            pbar.update(1)
+            return result
+
+        study.optimize(
+            _objective_with_progress,
+            n_trials=N_TRIALS,
+            timeout=OPTUNA_TIMEOUT,
+            n_jobs=1,
+            show_progress_bar=False,   # ← disable Optuna's own bar
+        )
     pruned   = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED)
     complete = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE)
     log.info("  Best %s=%.4f  params=%s  (complete=%d, pruned=%d)",
