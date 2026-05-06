@@ -286,7 +286,7 @@ def tune_hyperparameters(
              N_TRIALS, _timeout_label, SEARCH_SUBSAMPLE * 100,
              metric.name, CV_FOLDS if use_cv else "off", WIDE_SEARCH)
     study.optimize(objective, n_trials=N_TRIALS, timeout=OPTUNA_TIMEOUT,
-                   n_jobs=1 if use_cv else -1, show_progress_bar=True)
+                   n_jobs=1, show_progress_bar=True)
     pruned   = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED)
     complete = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE)
     log.info("  Best %s=%.4f  params=%s  (complete=%d, pruned=%d)",
