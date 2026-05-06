@@ -69,14 +69,24 @@ def plot_confusion_matrix(y_test: np.ndarray, y_pred: np.ndarray) -> None:
     cm        = confusion_matrix(y_test, y_pred)
     labels    = sorted(np.unique(np.concatenate([y_test, y_pred])).tolist())
     labels_s  = [str(l) for l in labels]
+    n         = len(labels)
+    coords    = list(range(n))
     cm_norm   = cm.astype(float) / cm.sum(axis=1, keepdims=True).clip(min=1)
-    fig = go.Figure(go.Heatmap(z=cm_norm, x=labels_s, y=labels_s,
+    # Use numeric coordinates so axis labels move with the plot during zoom/pan.
+    # tickvals/ticktext map those integers back to the class names.
+    fig = go.Figure(go.Heatmap(z=cm_norm, x=coords, y=coords,
                                colorscale="Blues", showscale=True, text=cm,
                                texttemplate="%{text}",
                                hovertemplate="True: %{y}<br>Pred: %{x}<br>Count: %{text}<extra></extra>"))
+    axis_common = dict(
+        tickvals=coords, ticktext=labels_s,
+        fixedrange=False,
+    )
     fig.update_layout(title="Confusion Matrix (row-normalised colour, raw count labels)",
                       xaxis_title="Predicted", yaxis_title="True",
-                      template="simple_white", yaxis=dict(autorange="reversed"))
+                      template="simple_white",
+                      xaxis=dict(**axis_common),
+                      yaxis=dict(**axis_common, autorange="reversed"))
     path = PLOT_OUTPUT_DIR / "confusion_matrix.html"
     fig.write_html(str(path), include_plotlyjs="cdn")
     log.info("  Confusion matrix → %s", path)
@@ -151,11 +161,20 @@ def plot_feature_importance(
     n_feat = min(len(feat_names), len(scores))
     imp_df = (pd.DataFrame({"feature": feat_names[:n_feat], "importance": scores[:n_feat]})
               .sort_values("importance", ascending=False).head(20))
-    fig = px.bar(imp_df.sort_values("importance"), x="importance", y="feature", orientation="h",
-                 title="Top 20 Feature Importances — XGBoost (gain)",
-                 labels={"importance": "Importance (gain)", "feature": ""},
-                 template="simple_white", color="importance", color_continuous_scale="Blues")
-    fig.update_coloraxes(showscale=False)
+    sorted_df = imp_df.sort_values("importance").reset_index(drop=True)
+    coords    = list(range(len(sorted_df)))
+    # Numeric y-axis so tick labels travel with bars during zoom/pan.
+    fig = go.Figure(go.Bar(
+        x=sorted_df["importance"], y=coords, orientation="h",
+        marker=dict(color=sorted_df["importance"], colorscale="Blues", showscale=False),
+    ))
+    fig.update_layout(
+        title="Top 20 Feature Importances — XGBoost (gain)",
+        xaxis_title="Importance (gain)",
+        yaxis=dict(tickvals=coords, ticktext=sorted_df["feature"].tolist(),
+                   title="", fixedrange=False),
+        template="simple_white",
+    )
     path = PLOT_OUTPUT_DIR / "feature_importance.html"
     fig.write_html(str(path), include_plotlyjs="cdn")
     log.info("  Feature importance → %s", path)
@@ -299,13 +318,17 @@ def plot_permutation_importance(
     stds  = result.importances_std
     n_feat = min(len(feat_names), len(means))
     imp_df = (pd.DataFrame({"feature": feat_names[:n_feat], "mean": means[:n_feat], "std": stds[:n_feat]})
-              .sort_values("mean", ascending=True).tail(20))
+              .sort_values("mean", ascending=True).tail(20).reset_index(drop=True))
+    coords = list(range(len(imp_df)))
+    # Numeric y-axis so tick labels travel with bars during zoom/pan.
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=imp_df["mean"], y=imp_df["feature"], orientation="h",
+    fig.add_trace(go.Bar(x=imp_df["mean"], y=coords, orientation="h",
                          error_x=dict(type="data", array=imp_df["std"].tolist(), visible=True),
                          marker_color="#CC3333", opacity=0.8, name="Permutation importance"))
     fig.update_layout(title=f"Top 20 Permutation Importances (test set, scoring={scoring})",
-                      xaxis_title=f"Mean decrease in {scoring}", yaxis_title="",
+                      xaxis_title=f"Mean decrease in {scoring}",
+                      yaxis=dict(tickvals=coords, ticktext=imp_df["feature"].tolist(),
+                                 title="", fixedrange=False),
                       template="simple_white")
     path = PLOT_OUTPUT_DIR / "permutation_importance.html"
     fig.write_html(str(path), include_plotlyjs="cdn")
@@ -369,15 +392,18 @@ def plot_threshold_sweep(
                      "support":   int(y_pred.sum())})
     sweep_df = pd.DataFrame(rows)
     metrics_to_plot = ["precision", "recall", "f1"]
+    metric_coords   = list(range(len(metrics_to_plot)))
+    # Use numeric y-coordinates so axis labels move with the heatmap cells during zoom/pan.
     fig = go.Figure(go.Heatmap(z=sweep_df[metrics_to_plot].values.T,
-                               x=sweep_df["threshold"].tolist(), y=metrics_to_plot,
+                               x=sweep_df["threshold"].tolist(), y=metric_coords,
                                colorscale="RdYlGn", zmin=0, zmax=1))
     fig.add_trace(go.Scatter(x=sweep_df["threshold"], y=sweep_df["support"] / len(y_arr),
                              mode="lines", name="Positive rate", yaxis="y2",
                              line=dict(color="navy", width=1.5, dash="dot")))
     fig.update_layout(title="Threshold Sweep — Precision / Recall / F1",
                       xaxis_title="Decision threshold",
-                      yaxis=dict(title="Metric", tickvals=list(range(3)), ticktext=metrics_to_plot),
+                      yaxis=dict(title="Metric", tickvals=metric_coords, ticktext=metrics_to_plot,
+                                 fixedrange=False),
                       yaxis2=dict(title="Predicted positive rate", overlaying="y", side="right",
                                   range=[0, 1], showgrid=False),
                       template="simple_white")
