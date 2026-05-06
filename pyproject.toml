@@ -17,6 +17,7 @@ dependencies = [
     "omegaconf>=2.3.0",
     "mlflow>=3.11.1",
     "pandera>=0.31.1",
+    "polars>=1.40.1",
 ]
 
 [project.scripts]

@@ -19,7 +19,9 @@ def test_chunked_csv_loading_reads_all_rows(tmp_path, monkeypatch):
     assert df["x"].tolist() == [0, 1, 2, 3, 4]
 
 
-def test_clean_data_adds_cyclical_datetime_features():
+def test_clean_data_adds_cyclical_datetime_features(tmp_path, monkeypatch):
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+
     df = pd.DataFrame({
         "event_time": ["2026-01-05 00:00:00", "2026-07-05 12:00:00"],
         "target": [0, 1],
