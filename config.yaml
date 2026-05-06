@@ -24,7 +24,7 @@ log_file: null              # null = stdout only; or "train.log"
 #   cv_folds > 0  → always use CV with that many folds
 #   cv_folds = 0  → always use fast-path subsample
 #   cv_folds = -1 → auto: CV when n_rows < 50k, fast-path otherwise  (recommended)
-cv_folds: -1
+cv_folds: 5
 cv_strategy: stratified     # "stratified" | "timeseries"
 
 # ── Optuna ────────────────────────────────────
@@ -39,7 +39,7 @@ n_estimators_max: 300
 early_stop_rnds: 20
 
 # ── PCA ───────────────────────────────────────
-pca_threshold: 10
+pca_threshold: 999
 pca_variance: 0.95
 pca_max_components: null
 
@@ -57,7 +57,7 @@ drift_alpha: 0.05           # p-value threshold; feature flagged if p < alpha
 drift_warn_only: true       # false → raise ValueError on any drift detected
 
 # ── Feature selection (UPGRADE 23) ────────────
-feature_selection: false    # true → RFECV before Optuna; drops low-value features
+feature_selection: true   # true → RFECV before Optuna; drops low-value features
 
 # ── Target encoding (UPGRADE 24) ──────────────
 target_encoding_threshold: 50  # object cols with > N unique vals → TargetEncoder (not OHE)
@@ -108,7 +108,7 @@ ensemble:
 
 # ── Diagnostics / plots ───────────────────────
 diagnostics:
-  plots_enabled: true
+  plots_enabled: false
   optuna_plots: true
   learning_curve: true
   permutation_importance: true
@@ -124,3 +124,10 @@ drift_monitor:
   min_feature_drift_ratio: 0.10
   retrain_feature_ratio: 0.25
   retrain_severity: high    # none | low | medium | high
+
+#Optional PowerTransform
+power_transform: true
+
+# ── Pre-transform hooks ───────────────────────────────────────
+pretransform_log1p_cols: []   # log1p applied before PowerTransformer
+pretransform_drop_cols: []      # dropped before any feature work

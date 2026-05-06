@@ -104,6 +104,8 @@ class TrainingConfig:
     diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
     ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
     drift_monitor: DriftMonitorConfig = field(default_factory=DriftMonitorConfig)
+    pretransform_log1p_cols: list[str] = field(default_factory=list)
+    pretransform_drop_cols:  list[str] = field(default_factory=list)
 
 
 def _section(cls, data: dict[str, Any], key: str):

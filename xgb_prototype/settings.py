@@ -116,6 +116,9 @@ USE_GPU               = bool(_c("use_gpu",                False))
 PANDERA_VALIDATION    = bool(_c("pandera_validation",     True))
 METRIC_NAME           = str(_c("metric",                  "auto")).lower()
 CALIBRATION_ENABLED   = bool(_c("calibration_enabled",   True))
+POWER_TRANSFORM = bool(_c("power_transform", True))
+PRETRANSFORM_LOG1P_COLS = list(_c("pretransform_log1p_cols", []))
+PRETRANSFORM_DROP_COLS  = list(_c("pretransform_drop_cols",  []))
 
 THRESHOLD_POLICY = normalize_policy(
     {

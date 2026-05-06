@@ -89,7 +89,8 @@ from xgb_prototype.settings import (
 from xgb_prototype.metrics import select_metric
 from xgb_prototype.data import (
     load_data, clean_data, validate_data, validate_pandera,
-    detect_drift, maybe_log_transform, check_config,
+    detect_drift, maybe_log_transform, check_config, apply_pretransforms,
+    clear_cache, cache_info,
 )
 from xgb_prototype.features import (
     detect_feature_types, filter_low_variance,
@@ -123,6 +124,22 @@ check_deps()
 # ─────────────────────────────────────────────
 
 def main() -> None:
+    import argparse as _argparse
+    _parser = _argparse.ArgumentParser(add_help=False)
+    _parser.add_argument("--clear-cache", action="store_true",
+                         help="Delete all xgb_clean_*.parquet temp files before training.")
+    _parser.add_argument("--cache-info",  action="store_true",
+                         help="Print cache file info and exit.")
+    _cli, _ = _parser.parse_known_args()
+
+    if _cli.cache_info:
+        cache_info()
+        return
+
+    if _cli.clear_cache:
+        log.info("[cache] --clear-cache flag set — wiping stale cache files...")
+        clear_cache()
+
     log.info("=" * 60)
     log.info(" XGBoost v7 · Optuna+CV · Calibration · SHAP · Plotly · Versioned")
     log.info("=" * 60)
@@ -140,6 +157,7 @@ def main() -> None:
         df = load_data()
         check_config(df)
         df = clean_data(df)
+        df = apply_pretransforms(df)
         validate_data(df)
         validate_pandera(df, TARGET_COL)
 

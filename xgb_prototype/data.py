@@ -34,6 +34,7 @@ from .settings import (
     N_ESTIMATORS_MAX, EARLY_STOP_RNDS, PCA_VARIANCE, IMBALANCE_THRESHOLD,
     CARDINALITY_LIMIT, OUTLIER_CONTAMINATION, PDP_TOP_N, CB_LOG_PERIOD,
     VARIANCE_THRESHOLD, TARGET_ENC_THRESHOLD,
+    PRETRANSFORM_LOG1P_COLS, PRETRANSFORM_DROP_COLS,
 )
 
 log = logging.getLogger(__name__)
@@ -141,11 +142,17 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     import tempfile, os
 
-    # ── Parquet cache key: source file mtime + raw shape ─────────────────────
+    # ── Parquet cache key: source mtime + raw shape + pretransform config ────
+    # Includes pretransform cols so any config change auto-busts the cache.
     _source_path = Path(str(DATA_PATH))
+    _pretransform_sig = (
+        "log1p=" + ",".join(sorted(PRETRANSFORM_LOG1P_COLS))
+        + "|drop=" + ",".join(sorted(PRETRANSFORM_DROP_COLS))
+    )
     _cache_key   = (
         f"{_source_path.stat().st_mtime_ns if _source_path.exists() else 0}"
         f"_{df.shape[0]}_{df.shape[1]}"
+        f"_{_pretransform_sig}"
     )
     _cache_hash  = hashlib.md5(_cache_key.encode()).hexdigest()[:10]
     _cache_file  = Path(tempfile.gettempdir()) / f"xgb_clean_{_cache_hash}.parquet"
@@ -253,6 +260,80 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
         log.debug("  Cache write skipped: %s", exc)
 
     return df
+
+def apply_pretransforms(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply config-driven column-level transforms before the main pipeline."""
+
+    for col in PRETRANSFORM_LOG1P_COLS:
+        if col in df.columns:
+            df[col] = np.log1p(df[col])
+            log.info("  [pretransform] log1p applied to '%s'", col)
+        else:
+            log.warning("  [pretransform] log1p requested for '%s' but column not found", col)
+
+    drop = [c for c in PRETRANSFORM_DROP_COLS if c in df.columns]
+    if drop:
+        df = df.drop(columns=drop)
+        log.info("  [pretransform] dropped column(s): %s", drop)
+
+    return df
+
+# ── Cache management ─────────────────────────────────────────────────────────
+
+def clear_cache(verbose: bool = True) -> int:
+    """Delete all xgb_clean_*.parquet files from the system temp directory.
+
+    Call this any time you change config.yaml values that affect data shape or
+    content *before* the pipeline runs (e.g. pretransform_log1p_cols,
+    pretransform_drop_cols, data_path).  The cache key is now pretransform-aware
+    so most busts happen automatically, but this function is the manual escape
+    hatch for anything the key doesn't cover.
+
+    Returns the number of files deleted.
+    """
+    import tempfile as _tempfile
+    tmp = Path(_tempfile.gettempdir())
+    files = list(tmp.glob("xgb_clean_*.parquet"))
+    for f in files:
+        try:
+            f.unlink()
+            if verbose:
+                log.info("[cache] Deleted stale cache file: %s", f)
+        except OSError as exc:
+            log.warning("[cache] Could not delete %s: %s", f, exc)
+    if verbose:
+        if files:
+            log.info("[cache] Cleared %d cache file(s) from %s", len(files), tmp)
+        else:
+            log.info("[cache] No cache files found in %s — nothing to clear.", tmp)
+    return len(files)
+
+
+def cache_info() -> list[dict]:
+    """Return metadata about any existing xgb_clean_*.parquet cache files.
+
+    Useful for debugging stale-cache issues: shows path, size, and age.
+    """
+    import tempfile as _tempfile
+    import time as _time
+    tmp   = Path(_tempfile.gettempdir())
+    now   = _time.time()
+    infos = []
+    for f in sorted(tmp.glob("xgb_clean_*.parquet")):
+        stat = f.stat()
+        age_min = (now - stat.st_mtime) / 60
+        infos.append({
+            "path":      str(f),
+            "size_mb":   round(stat.st_size / 1024 / 1024, 2),
+            "age_min":   round(age_min, 1),
+        })
+        log.info(
+            "[cache] %s  (%.1f MB, %.0f min old)",
+            f.name, infos[-1]["size_mb"], age_min,
+        )
+    if not infos:
+        log.info("[cache] No xgb_clean_*.parquet files found in %s", tmp)
+    return infos
 
 
 # ── Great Expectations validation ─────────────────────────────────────────────

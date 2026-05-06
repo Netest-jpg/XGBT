@@ -25,7 +25,7 @@ from .settings import (
     CB_LOG_PERIOD, CALIBRATION_ENABLED, CV_FOLDS, CV_STRATEGY, EARLY_STOP_RNDS,
     N_ESTIMATORS_MAX, N_TRIALS, OPTUNA_BUDGET_SECONDS, OPTUNA_TIMEOUT,
     PCA_MAX_COMPONENTS, PCA_VARIANCE,
-    RANDOM_STATE, SEARCH_SUBSAMPLE, USE_GPU, WIDE_SEARCH, ENSEMBLE_ENABLED, ENSEMBLE_TOP_K,
+    RANDOM_STATE, SEARCH_SUBSAMPLE, USE_GPU, WIDE_SEARCH, ENSEMBLE_ENABLED, ENSEMBLE_TOP_K, POWER_TRANSFORM,
 )
 from .metrics import MetricConfig
 
@@ -136,10 +136,9 @@ def build_pipeline(
     params      = params or {}
     tree_method, device = _resolve_tree_method()
 
-    num_steps = [
-        ("imputer", SimpleImputer(strategy="median")),
-        ("power",   PowerTransformer(method="yeo-johnson")),
-    ]
+    num_steps = [("imputer", SimpleImputer(strategy="median"))]
+    if POWER_TRANSFORM:
+        num_steps.append(("power", PowerTransformer(method="yeo-johnson")))
     if use_pca:
         n_comp = PCA_MAX_COMPONENTS if PCA_MAX_COMPONENTS is not None else PCA_VARIANCE
         num_steps.append(("pca", PCA(n_components=n_comp, random_state=RANDOM_STATE)))
