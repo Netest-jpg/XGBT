@@ -214,7 +214,6 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
         sins = np.stack([np.sin(month_angle), np.sin(dow_angle), np.sin(hour_angle)], axis=1)
         coss = np.stack([np.cos(month_angle), np.cos(dow_angle), np.cos(hour_angle)], axis=1)
 
-        new_cols[col]                    = parsed
         new_cols[f"{col}_year"]          = parsed.dt.year.to_numpy()
         new_cols[f"{col}_month"]         = _month.astype(int)
         new_cols[f"{col}_dayofweek"]     = _dow.astype(int)
