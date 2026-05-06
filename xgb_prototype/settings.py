@@ -73,13 +73,15 @@ CSV_CHUNK_SIZE       = None if _csv_chunk_size_cfg in (None, "null", 0) else int
 CSV_CHUNK_LOG_EVERY  = max(1, int(_c("csv_chunk_log_every", 10)))
 
 # ── CV / search ───────────────────────────────────────────────────────────────
-CV_FOLDS          = _c("cv_folds",       5)
+CV_FOLDS          = int(_c("cv_folds",    -1))   # -1=auto, 0=force off, N>0=force N folds
 CV_STRATEGY       = _c("cv_strategy",    "stratified")
 WIDE_SEARCH       = bool(_c("wide_search", False))
 
 N_TRIALS          = _c("n_trials",       50 if WIDE_SEARCH else 30)
-_timeout_cfg      = _c("optuna_timeout", 40 if WIDE_SEARCH else 25)
+_timeout_cfg      = _c("optuna_timeout", None)    # None = no hard cap; use budget knob instead
 OPTUNA_TIMEOUT    = None if _timeout_cfg is None else int(_timeout_cfg)
+_budget_cfg       = _c("optuna_budget_seconds", None)
+OPTUNA_BUDGET_SECONDS = None if _budget_cfg is None else int(_budget_cfg)
 SEARCH_SUBSAMPLE  = _c("search_subsample",   0.6)
 N_ESTIMATORS_MAX  = _c("n_estimators_max",   400 if WIDE_SEARCH else 300)
 EARLY_STOP_RNDS   = _c("early_stop_rnds",    20)

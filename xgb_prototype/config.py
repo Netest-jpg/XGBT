@@ -69,10 +69,11 @@ class TrainingConfig:
     plot_output_dir: str = "plots"
     log_level: str = "INFO"
     log_file: str | None = None
-    cv_folds: int = 5
+    cv_folds: int = -1
     cv_strategy: str = "stratified"
     n_trials: int = 30
     optuna_timeout: int | None = None
+    optuna_budget_seconds: int | None = None  # single budget knob; drives timeout + n_trials
     search_subsample: float = 0.6
     n_estimators_max: int = 300
     early_stop_rnds: int = 20

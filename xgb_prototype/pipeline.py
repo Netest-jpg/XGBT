@@ -1,6 +1,6 @@
 """pipeline.py — XGB callback, GPU helper, pipeline builder, Optuna tuning, ensemble."""
 from __future__ import annotations
-
+import time
 import importlib.metadata
 import logging
 from typing import Any
@@ -23,7 +23,8 @@ from xgboost import callback as xgb_callback
 
 from .settings import (
     CB_LOG_PERIOD, CALIBRATION_ENABLED, CV_FOLDS, CV_STRATEGY, EARLY_STOP_RNDS,
-    N_ESTIMATORS_MAX, N_TRIALS, OPTUNA_TIMEOUT, PCA_MAX_COMPONENTS, PCA_VARIANCE,
+    N_ESTIMATORS_MAX, N_TRIALS, OPTUNA_BUDGET_SECONDS, OPTUNA_TIMEOUT,
+    PCA_MAX_COMPONENTS, PCA_VARIANCE,
     RANDOM_STATE, SEARCH_SUBSAMPLE, USE_GPU, WIDE_SEARCH, ENSEMBLE_ENABLED, ENSEMBLE_TOP_K,
 )
 from .metrics import MetricConfig
@@ -198,6 +199,9 @@ def tune_hyperparameters(
     use_pca: bool,
 ) -> tuple[dict, optuna.Study]:
     """FIX 2 + U1/U8/U17: Optuna TPE search. Returns (best_params, study)."""
+    import time
+
+    # ── Pre-fit preprocessor once ─────────────────────────────────────────────
     log.info("  Pre-fitting preprocessor on X_train (once, loky backend)...")
     _prep_pipe = build_pipeline(num_cols, ohe_cat_cols, te_cat_cols, task, metric, use_pca=use_pca)
     preprocessor = _prep_pipe.named_steps["preprocessor"]
@@ -207,17 +211,83 @@ def tune_hyperparameters(
     y_train_arr = np.array(y_train)
     y_val_arr   = np.array(y_val)
 
-    use_cv = CV_FOLDS > 0
-    if use_cv:
-        cv_splitter = (
-            TimeSeriesSplit(n_splits=CV_FOLDS)
-            if CV_STRATEGY == "timeseries"
-            else StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-        )
-        log.info("  CV enabled: %s, %d folds", cv_splitter.__class__.__name__, CV_FOLDS)
-    else:
-        log.info("  CV disabled (CV_FOLDS=0) — single val split (fast path)")
+    n_rows = len(X_train_proc)
 
+    # ── CV vs. fast-path: data-driven default, manual override respected ──────
+    # Manual override: CV_FOLDS > 0 forces CV on; CV_FOLDS == 0 forces it off.
+    # Auto (CV_FOLDS < 0 or sentinel -1 in config): use CV only for small data.
+    _CV_AUTO_THRESHOLD = 50_000
+    if CV_FOLDS > 0:
+        use_cv = True
+    elif CV_FOLDS == 0:
+        use_cv = False
+    else:                           # CV_FOLDS = -1 → auto
+        use_cv = n_rows < _CV_AUTO_THRESHOLD
+
+    if use_cv:
+        n_folds = CV_FOLDS if CV_FOLDS > 0 else 5   # auto → 5 folds
+        cv_splitter = (
+            TimeSeriesSplit(n_splits=n_folds)
+            if CV_STRATEGY == "timeseries"
+            else StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
+        )
+        log.info("  CV enabled: %s, %d folds (n_rows=%d)",
+                 cv_splitter.__class__.__name__, n_folds, n_rows)
+    else:
+        log.info("  CV disabled — fast-path subsample (n_rows=%d)", n_rows)
+
+    # ── Subsample cap: absolute rows, not just a fraction ─────────────────────
+    # SEARCH_SUBSAMPLE=0.6 on 500k rows = 300k — defeats the "fast path" purpose.
+    # Cap at 50k rows regardless of fraction.
+    _SUBSAMPLE_ROW_CAP = 50_000
+    n_sub = min(max(int(n_rows * SEARCH_SUBSAMPLE), 100), _SUBSAMPLE_ROW_CAP)
+    log.info("  Search subsample: %d / %d rows (%.1f%%)",
+             n_sub, n_rows, 100 * n_sub / n_rows)
+
+    # ── Budget-driven n_trials / timeout ──────────────────────────────────────
+    # Priority: explicit N_TRIALS / OPTUNA_TIMEOUT beat the budget knob.
+    # Budget knob (OPTUNA_BUDGET_SECONDS) is the "easy" path for new users.
+    budget_sec = OPTUNA_BUDGET_SECONDS   # may be None
+
+    def _run_canary() -> float:
+        """Time one trial to calibrate n_trials from the budget."""
+        t0 = time.perf_counter()
+        _mdl = XGBClassifier if task == "classification" else XGBRegressor
+        _n   = min(n_sub, 5_000)          # tiny slice — just need a timing signal
+        _idx = np.random.default_rng(0).integers(0, n_rows, size=_n)
+        _m   = _mdl(
+            n_estimators=50, max_depth=4, learning_rate=0.1,
+            early_stopping_rounds=10, random_state=RANDOM_STATE,
+            eval_metric=metric.eval_metric, nthread=-1, tree_method="hist",
+        )
+        _m.fit(X_train_proc[_idx], y_train_arr[_idx],
+               eval_set=[(X_val_proc, y_val_arr)], verbose=False)
+        elapsed = time.perf_counter() - t0
+        return max(elapsed, 0.1)     # floor to avoid division by zero
+
+    # Derive timeout and n_trials
+    if OPTUNA_TIMEOUT is not None:
+        # Fully explicit override — respect it as-is
+        effective_timeout = OPTUNA_TIMEOUT
+        effective_n_trials = N_TRIALS
+        log.info("  Budget: explicit timeout=%ds, n_trials=%d", effective_timeout, effective_n_trials)
+    elif budget_sec is not None:
+        canary_sec = _run_canary()
+        log.info("  Canary trial: %.2fs per trial", canary_sec)
+        # Reserve 10 % of the budget for TPE overhead / pruner book-keeping
+        usable = budget_sec * 0.90
+        derived_trials = max(10, int(usable / canary_sec))
+        effective_timeout = budget_sec
+        effective_n_trials = derived_trials
+        log.info("  Budget=%ds → ~%d trials (%.1fs each)",
+                 budget_sec, derived_trials, canary_sec)
+    else:
+        # No budget, no timeout — fall back to bare N_TRIALS, no wall-clock guard
+        effective_timeout = None
+        effective_n_trials = N_TRIALS
+        log.info("  Budget: n_trials=%d, no timeout", effective_n_trials)
+
+    # ── Objective ─────────────────────────────────────────────────────────────
     def objective(trial: optuna.Trial) -> float:
         if WIDE_SEARCH:
             params = {
@@ -240,8 +310,12 @@ def tune_hyperparameters(
                 "reg_lambda":       trial.suggest_float("reg_lambda", 0.1, 5.0, log=True),
             }
 
-        shared = dict(n_estimators=N_ESTIMATORS_MAX, early_stopping_rounds=EARLY_STOP_RNDS,
-                      random_state=RANDOM_STATE, eval_metric=metric.eval_metric, nthread=1, **params)
+        shared = dict(
+            n_estimators=N_ESTIMATORS_MAX, early_stopping_rounds=EARLY_STOP_RNDS,
+            random_state=RANDOM_STATE, eval_metric=metric.eval_metric,
+            nthread=-1,   # ← was nthread=1; safe because Optuna n_jobs=1
+            **params,
+        )
         if metric.scale_pos_weight is not None:
             shared["scale_pos_weight"] = metric.scale_pos_weight
 
@@ -260,13 +334,12 @@ def tune_hyperparameters(
                     raise optuna.exceptions.TrialPruned()
             return float(np.mean(fold_scores))
 
-        # Fast-path: stratified subsample
-        n_sub = max(int(len(X_train_proc) * SEARCH_SUBSAMPLE), 100)
+        # Fast-path: stratified subsample (capped at _SUBSAMPLE_ROW_CAP rows)
         if task == "classification":
             sss = StratifiedShuffleSplit(n_splits=1, train_size=n_sub, random_state=trial.number)
             idx, _ = next(sss.split(X_train_proc, y_train_arr))
         else:
-            idx = np.random.RandomState(trial.number).choice(len(X_train_proc), size=n_sub, replace=False)
+            idx = np.random.RandomState(trial.number).choice(n_rows, size=n_sub, replace=False)
         mdl = XGBClassifier(**shared) if task == "classification" else XGBRegressor(**shared)
         mdl.fit(X_train_proc[idx], y_train_arr[idx], eval_set=[(X_val_proc, y_val_arr)], verbose=False)
         y_pred  = mdl.predict(X_val_proc)
@@ -277,15 +350,16 @@ def tune_hyperparameters(
             raise optuna.exceptions.TrialPruned()
         return score
 
+    # ── Run study ─────────────────────────────────────────────────────────────
     pruner  = optuna.pruners.MedianPruner(n_warmup_steps=10)
     sampler = optuna.samplers.TPESampler(seed=RANDOM_STATE, n_startup_trials=10)
     study   = optuna.create_study(direction=metric.direction, sampler=sampler, pruner=pruner)
-    _timeout_label = f"{OPTUNA_TIMEOUT}s" if OPTUNA_TIMEOUT is not None else "none"
-    log.info("[5/9] Optuna search (%d trials · %s timeout · %.0f%% subsample · "
+    _timeout_label = f"{effective_timeout}s" if effective_timeout is not None else "none"
+    log.info("[5/9] Optuna search (%d trials · %s timeout · %d subsample rows · "
              "metric=%s · cv=%s · wide=%s)...",
-             N_TRIALS, _timeout_label, SEARCH_SUBSAMPLE * 100,
-             metric.name, CV_FOLDS if use_cv else "off", WIDE_SEARCH)
-    with tqdm(total=N_TRIALS, ncols=100, desc="Optuna search") as pbar:
+             effective_n_trials, _timeout_label, n_sub,
+             metric.name, n_folds if use_cv else "off", WIDE_SEARCH)
+    with tqdm(total=effective_n_trials, ncols=100, desc="Optuna search") as pbar:
         def _objective_with_progress(trial):
             result = objective(trial)
             completed = [t for t in study.trials if t.value is not None]
@@ -296,17 +370,16 @@ def tune_hyperparameters(
 
         study.optimize(
             _objective_with_progress,
-            n_trials=N_TRIALS,
-            timeout=OPTUNA_TIMEOUT,
+            n_trials=effective_n_trials,
+            timeout=effective_timeout,
             n_jobs=1,
-            show_progress_bar=False,   # ← disable Optuna's own bar
+            show_progress_bar=False,
         )
     pruned   = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED)
     complete = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE)
     log.info("  Best %s=%.4f  params=%s  (complete=%d, pruned=%d)",
              metric.name, study.best_value, study.best_params, complete, pruned)
     return study.best_params, study
-
 
 # ── Top-K ensemble (UPGRADE 11) ───────────────────────────────────────────────
 

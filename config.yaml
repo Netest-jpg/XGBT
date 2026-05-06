@@ -20,12 +20,20 @@ log_level: INFO             # DEBUG | INFO | WARNING | ERROR
 log_file: null              # null = stdout only; or "train.log"
 
 # ── Cross-validation ──────────────────────────
-cv_folds: 5                 # 0 = single-split fast path
+# CV vs fast-path:
+#   cv_folds > 0  → always use CV with that many folds
+#   cv_folds = 0  → always use fast-path subsample
+#   cv_folds = -1 → auto: CV when n_rows < 50k, fast-path otherwise  (recommended)
+cv_folds: -1
 cv_strategy: stratified     # "stratified" | "timeseries"
 
 # ── Optuna ────────────────────────────────────
 n_trials: 30
+optuna_budget_seconds: null   # set to e.g. 300 to enable budget-driven tuning
 optuna_timeout: null        # seconds; null = run all n_trials
+# ── Search subsample ──────────────────────────────────────────────────────────
+# Fraction of training rows used per trial (fast-path only).
+# Hard-capped at 50k rows in code regardless of this value.
 search_subsample: 0.6
 n_estimators_max: 300
 early_stop_rnds: 20
