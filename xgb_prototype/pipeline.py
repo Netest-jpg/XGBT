@@ -23,7 +23,8 @@ from xgboost import callback as xgb_callback
 
 from .settings import (
     CB_LOG_PERIOD, CALIBRATION_ENABLED, CV_FOLDS, CV_STRATEGY, EARLY_STOP_RNDS,
-    N_ESTIMATORS_MAX, N_TRIALS, OPTUNA_BUDGET_SECONDS, OPTUNA_TIMEOUT,
+    N_ESTIMATORS_MAX, N_ESTIMATORS_MIN, TUNE_N_ESTIMATORS,
+    N_TRIALS, OPTUNA_BUDGET_SECONDS, OPTUNA_TIMEOUT,
     PCA_MAX_COMPONENTS, PCA_VARIANCE,
     RANDOM_STATE, SEARCH_SUBSAMPLE, USE_GPU, WIDE_SEARCH, ENSEMBLE_ENABLED, ENSEMBLE_TOP_K, POWER_TRANSFORM,
 )
@@ -309,10 +310,25 @@ def tune_hyperparameters(
                 "reg_lambda":       trial.suggest_float("reg_lambda", 0.1, 5.0, log=True),
             }
 
+        # ── n_estimators: tune directly or rely on early stopping ─────────────
+        # tune_n_estimators=true  → Optuna picks n_estimators (100–N_ESTIMATORS_MAX),
+        #                           no early stopping inside trials (cleaner CV signal).
+        # tune_n_estimators=false → fix at N_ESTIMATORS_MAX + early stopping
+        #                           (original behaviour, useful on datasets where
+        #                            the right tree count is unknown and runtime allows).
+        if TUNE_N_ESTIMATORS:
+            trial_n_estimators   = trial.suggest_int("n_estimators", N_ESTIMATORS_MIN, N_ESTIMATORS_MAX)
+            trial_early_stop     = None   # Optuna owns the depth — no early stopping
+        else:
+            trial_n_estimators   = N_ESTIMATORS_MAX
+            trial_early_stop     = EARLY_STOP_RNDS
+
         shared = dict(
-            n_estimators=N_ESTIMATORS_MAX, early_stopping_rounds=EARLY_STOP_RNDS,
-            random_state=RANDOM_STATE, eval_metric=metric.eval_metric,
-            nthread=-1,   # ← was nthread=1; safe because Optuna n_jobs=1
+            n_estimators          = trial_n_estimators,
+            early_stopping_rounds = trial_early_stop,
+            random_state          = RANDOM_STATE,
+            eval_metric           = metric.eval_metric,
+            nthread               = -1,
             **params,
         )
         if metric.scale_pos_weight is not None:
@@ -324,7 +340,11 @@ def tune_hyperparameters(
                 X_tr_f, X_vl_f = X_train_proc[tr_idx], X_train_proc[vl_idx]
                 y_tr_f, y_vl_f = y_train_arr[tr_idx],  y_train_arr[vl_idx]
                 mdl = XGBClassifier(**shared) if task == "classification" else XGBRegressor(**shared)
-                mdl.fit(X_tr_f, y_tr_f, eval_set=[(X_vl_f, y_vl_f)], verbose=False)
+                # eval_set only needed when early stopping is active
+                fit_kwargs: dict = {"verbose": False}
+                if trial_early_stop is not None:
+                    fit_kwargs["eval_set"] = [(X_vl_f, y_vl_f)]
+                mdl.fit(X_tr_f, y_tr_f, **fit_kwargs)
                 y_pred  = mdl.predict(X_vl_f)
                 y_proba = mdl.predict_proba(X_vl_f)[:, 1] if metric.needs_proba and task == "classification" else None
                 fold_scores.append(metric.score(y_vl_f, y_pred, y_proba))
@@ -354,10 +374,11 @@ def tune_hyperparameters(
     sampler = optuna.samplers.TPESampler(seed=RANDOM_STATE, n_startup_trials=10)
     study   = optuna.create_study(direction=metric.direction, sampler=sampler, pruner=pruner)
     _timeout_label = f"{effective_timeout}s" if effective_timeout is not None else "none"
+    _nest_label    = f"tuned({N_ESTIMATORS_MIN}–{N_ESTIMATORS_MAX})" if TUNE_N_ESTIMATORS else f"fixed@{N_ESTIMATORS_MAX}+earlystop"
     log.info("[5/9] Optuna search (%d trials · %s timeout · %d subsample rows · "
-             "metric=%s · cv=%s · wide=%s)...",
+             "metric=%s · cv=%s · wide=%s · n_estimators=%s)...",
              effective_n_trials, _timeout_label, n_sub,
-             metric.name, n_folds if use_cv else "off", WIDE_SEARCH)
+             metric.name, n_folds if use_cv else "off", WIDE_SEARCH, _nest_label)
     with tqdm(total=effective_n_trials, ncols=100, desc="Optuna search") as pbar:
         def _objective_with_progress(trial):
             result = objective(trial)

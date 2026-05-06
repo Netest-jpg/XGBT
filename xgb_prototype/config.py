@@ -75,7 +75,9 @@ class TrainingConfig:
     optuna_timeout: int | None = None
     optuna_budget_seconds: int | None = None  # single budget knob; drives timeout + n_trials
     search_subsample: float = 0.6
-    n_estimators_max: int = 300
+    n_estimators_max: int = 500
+    n_estimators_min: int = 100
+    tune_n_estimators: bool = True
     early_stop_rnds: int = 20
     pca_threshold: int = 10
     pca_variance: float = 0.95

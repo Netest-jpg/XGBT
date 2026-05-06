@@ -55,7 +55,8 @@ from xgb_prototype.settings import (
     # paths
     MODEL_OUTPUT_DIR, PLOT_OUTPUT_DIR,
     # optuna / model
-    N_ESTIMATORS_MAX, N_TRIALS, OPTUNA_TIMEOUT, WIDE_SEARCH,
+    N_ESTIMATORS_MAX, N_ESTIMATORS_MIN, TUNE_N_ESTIMATORS,
+    N_TRIALS, OPTUNA_TIMEOUT, WIDE_SEARCH,
     SEARCH_SUBSAMPLE, EARLY_STOP_RNDS, CV_FOLDS, CV_STRATEGY,
     # pca
     PCA_THRESHOLD, PCA_VARIANCE,
@@ -90,7 +91,6 @@ from xgb_prototype.metrics import select_metric
 from xgb_prototype.data import (
     load_data, clean_data, validate_data, validate_pandera,
     detect_drift, maybe_log_transform, check_config, apply_pretransforms,
-    clear_cache, cache_info,
 )
 from xgb_prototype.features import (
     detect_feature_types, filter_low_variance,
@@ -124,22 +124,6 @@ check_deps()
 # ─────────────────────────────────────────────
 
 def main() -> None:
-    import argparse as _argparse
-    _parser = _argparse.ArgumentParser(add_help=False)
-    _parser.add_argument("--clear-cache", action="store_true",
-                         help="Delete all xgb_clean_*.parquet temp files before training.")
-    _parser.add_argument("--cache-info",  action="store_true",
-                         help="Print cache file info and exit.")
-    _cli, _ = _parser.parse_known_args()
-
-    if _cli.cache_info:
-        cache_info()
-        return
-
-    if _cli.clear_cache:
-        log.info("[cache] --clear-cache flag set — wiping stale cache files...")
-        clear_cache()
-
     log.info("=" * 60)
     log.info(" XGBoost v7 · Optuna+CV · Calibration · SHAP · Plotly · Versioned")
     log.info("=" * 60)
@@ -260,43 +244,70 @@ def main() -> None:
             )
             plot_learning_curve(_lc_pipeline, X_trainval, y_trainval, metric, TASK)
 
-        # ── 6. Final fit with early stopping ─────────────────────────────────
+        # ── 6. Final fit ──────────────────────────────────────────────────────
+        # When tune_n_estimators=true: Optuna already found best n_estimators,
+        # it lives in best_params — pop it out, fit directly, no early stopping.
+        # When tune_n_estimators=false: use early stopping on train+val to find
+        # best_iteration, then refit at that depth (original behaviour).
         log.info("[6/9] Fitting final pipeline (train+val) with best params...")
-        final_pipeline = build_pipeline(
-            num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, best_params,
-            n_estimators=N_ESTIMATORS_MAX, early_stop=30, use_pca=use_pca,
-        )
-        preprocessor  = final_pipeline.named_steps["preprocessor"]
-        X_tv_proc     = preprocessor.fit_transform(X_trainval, y_trainval)
-        X_val_proc_es = preprocessor.transform(X_val)
-        X_test_proc   = preprocessor.transform(X_test)
 
-        _es_model = final_pipeline.named_steps["model"]
-        _es_model.set_params(callbacks=[_IterationLogCallback(period=CB_LOG_PERIOD, label="es-fit")])
-        _es_model.fit(
-            X_tv_proc, y_trainval,
-            eval_set=[(X_val_proc_es, y_val)],
-            verbose=False,
-        )
-        best_n = final_pipeline.named_steps["model"].best_iteration
-        log.info("  Early stopping → best n_estimators = %d (max was %d)", best_n, N_ESTIMATORS_MAX)
+        final_params = dict(best_params)   # don't mutate Optuna's dict
 
-        # ── Refit at exact best_iteration ────────────────────────────────────
-        log.info("  Refitting final model at best_iteration=%d...", best_n)
-        refit_pipeline = build_pipeline(
-            num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, best_params,
-            n_estimators=best_n, early_stop=0, use_pca=use_pca,
-        )
-        step_names = [name for name, _ in refit_pipeline.steps]
-        refit_pipeline.steps[step_names.index("preprocessor")] = ("preprocessor", preprocessor)
-        _refit_cb    = _IterationLogCallback(period=CB_LOG_PERIOD, label="refit")
-        _refit_model = refit_pipeline.named_steps["model"]
-        _refit_model.set_params(callbacks=[_refit_cb])
-        _refit_model.fit(X_tv_proc, y_trainval, verbose=False)
-        cb_history = _refit_cb.history
+        if TUNE_N_ESTIMATORS:
+            best_n = int(final_params.pop("n_estimators", N_ESTIMATORS_MAX))
+            log.info("  tune_n_estimators=true → using Optuna best n_estimators=%d", best_n)
+            refit_pipeline = build_pipeline(
+                num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, final_params,
+                n_estimators=best_n, early_stop=0, use_pca=use_pca,
+            )
+            preprocessor  = refit_pipeline.named_steps["preprocessor"]
+            X_tv_proc     = preprocessor.fit_transform(X_trainval, y_trainval)
+            X_val_proc    = preprocessor.transform(X_val)
+            X_test_proc   = preprocessor.transform(X_test)
+            _refit_cb     = _IterationLogCallback(period=CB_LOG_PERIOD, label="final")
+            refit_pipeline.named_steps["model"].set_params(callbacks=[_refit_cb])
+            refit_pipeline.named_steps["model"].fit(
+                X_tv_proc, y_trainval,
+                eval_set=[(X_val_proc, y_val)],
+                verbose=False,
+            )
+            cb_history    = _refit_cb.history
+        else:
+            # Original early-stopping path
+            final_pipeline = build_pipeline(
+                num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, final_params,
+                n_estimators=N_ESTIMATORS_MAX, early_stop=30, use_pca=use_pca,
+            )
+            preprocessor  = final_pipeline.named_steps["preprocessor"]
+            X_tv_proc     = preprocessor.fit_transform(X_trainval, y_trainval)
+            X_val_proc_es = preprocessor.transform(X_val)
+            X_val_proc    = X_val_proc_es   # alias for downstream compatibility
+            X_test_proc   = preprocessor.transform(X_test)
+
+            _es_model = final_pipeline.named_steps["model"]
+            _es_model.set_params(callbacks=[_IterationLogCallback(period=CB_LOG_PERIOD, label="es-fit")])
+            _es_model.fit(
+                X_tv_proc, y_trainval,
+                eval_set=[(X_val_proc_es, y_val)],
+                verbose=False,
+            )
+            best_n = final_pipeline.named_steps["model"].best_iteration
+            log.info("  Early stopping → best n_estimators = %d (max was %d)", best_n, N_ESTIMATORS_MAX)
+
+            log.info("  Refitting final model at best_iteration=%d...", best_n)
+            refit_pipeline = build_pipeline(
+                num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, final_params,
+                n_estimators=best_n, early_stop=0, use_pca=use_pca,
+            )
+            step_names = [name for name, _ in refit_pipeline.steps]
+            refit_pipeline.steps[step_names.index("preprocessor")] = ("preprocessor", preprocessor)
+            _refit_cb    = _IterationLogCallback(period=CB_LOG_PERIOD, label="refit")
+            _refit_model = refit_pipeline.named_steps["model"]
+            _refit_model.set_params(callbacks=[_refit_cb])
+            _refit_model.fit(X_tv_proc, y_trainval, verbose=False)
+            cb_history = _refit_cb.history
 
         # ── Calibration ──────────────────────────────────────────────────────
-        X_val_proc = X_val_proc_es
         if TASK == "classification" and CALIBRATION_ENABLED:
             log.info("[6c/9] Calibrating classifier (CalibratedClassifierCV prefit)...")
             raw_xgb = refit_pipeline.named_steps["model"]

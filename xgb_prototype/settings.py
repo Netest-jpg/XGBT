@@ -83,7 +83,9 @@ OPTUNA_TIMEOUT    = None if _timeout_cfg is None else int(_timeout_cfg)
 _budget_cfg       = _c("optuna_budget_seconds", None)
 OPTUNA_BUDGET_SECONDS = None if _budget_cfg is None else int(_budget_cfg)
 SEARCH_SUBSAMPLE  = _c("search_subsample",   0.6)
-N_ESTIMATORS_MAX  = _c("n_estimators_max",   400 if WIDE_SEARCH else 300)
+N_ESTIMATORS_MAX  = _c("n_estimators_max",   500 if WIDE_SEARCH else 500)
+N_ESTIMATORS_MIN  = int(_c("n_estimators_min",  100))
+TUNE_N_ESTIMATORS = bool(_c("tune_n_estimators", True))
 EARLY_STOP_RNDS   = _c("early_stop_rnds",    20)
 
 # ── PCA / imbalance ───────────────────────────────────────────────────────────

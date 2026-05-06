@@ -35,7 +35,10 @@ optuna_timeout: null        # seconds; null = run all n_trials
 # Fraction of training rows used per trial (fast-path only).
 # Hard-capped at 50k rows in code regardless of this value.
 search_subsample: 0.6
-n_estimators_max: 300
+n_estimators_max: 500
+n_estimators_min: 100        # lower bound when tune_n_estimators: true
+tune_n_estimators: true      # true → Optuna searches n_estimators (no early stopping in trials)
+                             # false → early stopping drives n_estimators (original behaviour)
 early_stop_rnds: 20
 
 # ── PCA ───────────────────────────────────────
@@ -57,7 +60,7 @@ drift_alpha: 0.05           # p-value threshold; feature flagged if p < alpha
 drift_warn_only: true       # false → raise ValueError on any drift detected
 
 # ── Feature selection (UPGRADE 23) ────────────
-feature_selection: true   # true → RFECV before Optuna; drops low-value features
+feature_selection: true    # true → RFECV before Optuna; drops low-value features
 
 # ── Target encoding (UPGRADE 24) ──────────────
 target_encoding_threshold: 50  # object cols with > N unique vals → TargetEncoder (not OHE)
@@ -124,7 +127,7 @@ drift_monitor:
   min_feature_drift_ratio: 0.10
   retrain_feature_ratio: 0.25
   retrain_severity: high    # none | low | medium | high
-
+  
 #Optional PowerTransform
 power_transform: true
 
