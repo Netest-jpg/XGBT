@@ -1,7 +1,9 @@
 """data.py — Data loading, cleaning, GX validation, Pandera schema, drift detection."""
 from __future__ import annotations
 
+import hashlib
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -10,6 +12,13 @@ import pandas as pd
 import great_expectations as gx
 logging.getLogger("great_expectations").setLevel(logging.WARNING)
 from scipy import stats as scipy_stats
+
+# ── Optional Polars (Phase 1) ─────────────────────────────────────────────────
+try:
+    import polars as pl
+    _POLARS_AVAILABLE = True
+except ImportError:
+    _POLARS_AVAILABLE = False
 
 try:
     import pandera as pa
@@ -33,7 +42,11 @@ log = logging.getLogger(__name__)
 # ── Load ──────────────────────────────────────────────────────────────────────
 
 def load_data() -> pd.DataFrame:
-    """UPGRADE 15: Glob-aware multi-format loader (csv/parquet/json/xlsx)."""
+    """Phase 1: Glob-aware multi-format loader with Polars + parallel reads.
+
+    Priority: Polars (rayon-parallelised) → pandas fallback.
+    Multiple files are read in parallel via ThreadPoolExecutor.
+    """
     import glob as _glob
 
     path_str = str(DATA_PATH)
@@ -43,91 +56,242 @@ def load_data() -> pd.DataFrame:
             f"data_path='{path_str}' matched no files. Check config.yaml → data_path."
         )
 
-    def _read_csv(p: str) -> pd.DataFrame:
+    # ── per-file reader ───────────────────────────────────────────────────────
+
+    def _read_csv_pandas(p: str) -> pd.DataFrame:
+        """Chunked or whole CSV read via pandas (fallback path)."""
         if CSV_CHUNK_SIZE is None:
-            return pd.read_csv(p)
-        log.info("[load] Streaming CSV '%s' in chunks of %d row(s)...", p, CSV_CHUNK_SIZE)
+            return pd.read_csv(p, low_memory=False)
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("[load] Streaming CSV '%s' in chunks of %d row(s)...", p, CSV_CHUNK_SIZE)
         chunks: list[pd.DataFrame] = []
         total_rows = 0
-        for chunk_idx, chunk in enumerate(pd.read_csv(p, chunksize=CSV_CHUNK_SIZE), 1):
+        for chunk_idx, chunk in enumerate(
+            pd.read_csv(p, chunksize=CSV_CHUNK_SIZE, low_memory=False), 1
+        ):
             chunks.append(chunk)
             total_rows += len(chunk)
-            if chunk_idx == 1 or chunk_idx % CSV_CHUNK_LOG_EVERY == 0:
-                log.info("[load]   chunk %d read → %d cumulative row(s)", chunk_idx, total_rows)
+            if log.isEnabledFor(logging.DEBUG) and (
+                chunk_idx == 1 or chunk_idx % CSV_CHUNK_LOG_EVERY == 0
+            ):
+                log.debug("[load]   chunk %d → %d cumulative rows", chunk_idx, total_rows)
         if not chunks:
             return pd.DataFrame()
-        log.info("[load] Completed chunked CSV '%s' → %d chunk(s), %d row(s)",
-                 p, len(chunks), total_rows)
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("[load] Finished chunked CSV '%s' → %d chunk(s), %d rows",
+                      p, len(chunks), total_rows)
         return pd.concat(chunks, ignore_index=True)
 
     def _read_one(p: str) -> pd.DataFrame:
         ext = Path(p).suffix.lower()
-        if ext == ".parquet":              return pd.read_parquet(p)
-        if ext in (".json", ".jsonl"):     return pd.read_json(p, lines=(ext == ".jsonl"))
-        if ext in (".xlsx", ".xls"):       return pd.read_excel(p)
-        return _read_csv(p)
 
-    frames = [_read_one(p) for p in paths]
+        if _POLARS_AVAILABLE:
+            try:
+                if ext == ".parquet":
+                    return pl.read_parquet(p, parallel="row_groups").to_pandas()
+                if ext == ".csv" and CSV_CHUNK_SIZE is None:
+                    return pl.read_csv(p, low_memory=False).to_pandas()
+                if ext in (".json", ".jsonl"):
+                    return pl.read_ndjson(p).to_pandas() if ext == ".jsonl" \
+                        else pl.read_json(p).to_pandas()
+                if ext in (".xlsx", ".xls"):
+                    return pl.read_excel(p).to_pandas()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[load] Polars failed for '%s' (%s) — falling back to pandas", p, exc)
+
+        # pandas fallback
+        if ext == ".parquet":
+            return pd.read_parquet(p)
+        if ext in (".json", ".jsonl"):
+            return pd.read_json(p, lines=(ext == ".jsonl"))
+        if ext in (".xlsx", ".xls"):
+            return pd.read_excel(p)
+        return _read_csv_pandas(p)
+
+    # ── parallel read (>1 file) or single direct call ─────────────────────────
+
+    if len(paths) == 1:
+        frames = [_read_one(paths[0])]
+    else:
+        frames_map: dict[str, pd.DataFrame] = {}
+        with ThreadPoolExecutor(max_workers=min(len(paths), 8)) as pool:
+            futs = {pool.submit(_read_one, p): p for p in paths}
+            for fut in as_completed(futs):
+                frames_map[futs[fut]] = fut.result()
+        frames = [frames_map[p] for p in paths]   # preserve glob sort order
+
     df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
-    log.info("[load] Read %d file(s) → %d rows × %d cols", len(paths), *df.shape)
+    log.info("[load] Read %d file(s) → %d rows × %d cols  (polars=%s)",
+             len(paths), *df.shape, _POLARS_AVAILABLE)
     return df
 
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Phase 2: Schema-driven cleaning with vectorised ops and optional Parquet cache.
+
+    Optimisations applied:
+    - df.mask() replaces chained replace() for sentinel removal
+    - datetime format detected once from a 200-row sample
+    - .dt accessors cached in locals; all 6 trig features in 2 numpy passes
+    - isnull().sum() gated behind DEBUG
+    - float32 cast at end to halve downstream memory
+    - Cleaned output cached as Parquet+Zstd; skips reprocessing on repeat runs
+    """
+    import tempfile, os
+
+    # ── Parquet cache key: source file mtime + raw shape ─────────────────────
+    _source_path = Path(str(DATA_PATH))
+    _cache_key   = (
+        f"{_source_path.stat().st_mtime_ns if _source_path.exists() else 0}"
+        f"_{df.shape[0]}_{df.shape[1]}"
+    )
+    _cache_hash  = hashlib.md5(_cache_key.encode()).hexdigest()[:10]
+    _cache_file  = Path(tempfile.gettempdir()) / f"xgb_clean_{_cache_hash}.parquet"
+
+    if _cache_file.exists():
+        log.info("[1/9] Cache hit — loading cleaned data from %s", _cache_file)
+        return pd.read_parquet(_cache_file)
+
     log.info("[1/9] Cleaning data... shape before: %s", df.shape)
+
+    # ── Drop all-NaN rows / duplicates ────────────────────────────────────────
     df = df.dropna(how="all").drop_duplicates()
-    df = df.replace([-999, -9999, "N/A", "n/a", "NA", "none", "None", ""], np.nan)
 
-    str_cols = df.select_dtypes(include="object").columns
-    df[str_cols] = df[str_cols].apply(lambda c: c.str.strip())
+    # ── Sentinel removal via mask (single vectorised pass) ────────────────────
+    _SENTINELS = {-999, -9999}
+    _STR_SENTINELS = {"N/A", "n/a", "NA", "none", "None", ""}
+    num_mask = df.select_dtypes(include="number").isin(_SENTINELS)
+    df[num_mask.columns] = df[num_mask.columns].mask(num_mask)
+    str_cols = df.select_dtypes(include="object").columns.tolist()
+    if str_cols:
+        df[str_cols] = df[str_cols].apply(lambda c: c.str.strip())
+        df[str_cols] = df[str_cols].apply(
+            lambda c: c.mask(c.isin(_STR_SENTINELS))
+        )
 
+    # ── Date column parsing ───────────────────────────────────────────────────
     date_cols = [
         c for c in df.columns
         if ("date" in c.lower() or "time" in c.lower()) and df[c].dtype == "object"
     ]
+
+    def _detect_format(series: pd.Series, sample_n: int = 200) -> str | None:
+        """Sample up to sample_n non-null values and guess the strftime format."""
+        sample = series.dropna().head(sample_n)
+        _FORMATS = [
+            "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d",
+            "%d/%m/%Y %H:%M:%S", "%d/%m/%Y", "%m/%d/%Y",
+        ]
+        for fmt in _FORMATS:
+            try:
+                pd.to_datetime(sample, format=fmt, errors="raise")
+                return fmt
+            except Exception:
+                continue
+        return None  # fall back to inference
+
+    new_cols: dict[str, np.ndarray | pd.Series] = {}
+    drop_cols: list[str] = []
+
     for col in date_cols:
-        parsed = pd.to_datetime(df[col], errors="coerce")
-        if parsed.notna().mean() > 0.5:
-            df[col] = parsed
-            df[f"{col}_year"]           = parsed.dt.year
-            df[f"{col}_month"]          = parsed.dt.month
-            df[f"{col}_dayofweek"]      = parsed.dt.dayofweek
-            df[f"{col}_hour"]           = parsed.dt.hour
-            month_angle = 2 * np.pi * (parsed.dt.month.astype(float) - 1) / 12
-            dow_angle   = 2 * np.pi * parsed.dt.dayofweek.astype(float) / 7
-            hour_angle  = 2 * np.pi * parsed.dt.hour.astype(float) / 24
-            df[f"{col}_month_sin"]      = np.sin(month_angle)
-            df[f"{col}_month_cos"]      = np.cos(month_angle)
-            df[f"{col}_dayofweek_sin"]  = np.sin(dow_angle)
-            df[f"{col}_dayofweek_cos"]  = np.cos(dow_angle)
-            df[f"{col}_hour_sin"]       = np.sin(hour_angle)
-            df[f"{col}_hour_cos"]       = np.cos(hour_angle)
-            df = df.drop(columns=[col])
-            log.info("  Parsed date column: '%s' → year/month/dayofweek/hour + sin/cos", col)
+        fmt    = _detect_format(df[col])
+        parsed = pd.to_datetime(df[col], format=fmt, errors="coerce")
+        if parsed.notna().mean() <= 0.5:
+            continue
+
+        # cache accessors once
+        _month = parsed.dt.month.astype(float).to_numpy()
+        _dow   = parsed.dt.dayofweek.astype(float).to_numpy()
+        _hour  = parsed.dt.hour.astype(float).to_numpy()
+
+        month_angle = 2 * np.pi * (_month - 1) / 12
+        dow_angle   = 2 * np.pi * _dow / 7
+        hour_angle  = 2 * np.pi * _hour / 24
+
+        # 2 numpy passes for all 6 trig features
+        sins = np.stack([np.sin(month_angle), np.sin(dow_angle), np.sin(hour_angle)], axis=1)
+        coss = np.stack([np.cos(month_angle), np.cos(dow_angle), np.cos(hour_angle)], axis=1)
+
+        new_cols[f"{col}_year"]          = parsed.dt.year.to_numpy()
+        new_cols[f"{col}_month"]         = _month.astype(int)
+        new_cols[f"{col}_dayofweek"]     = _dow.astype(int)
+        new_cols[f"{col}_hour"]          = _hour.astype(int)
+        new_cols[f"{col}_month_sin"]     = sins[:, 0]
+        new_cols[f"{col}_month_cos"]     = coss[:, 0]
+        new_cols[f"{col}_dayofweek_sin"] = sins[:, 1]
+        new_cols[f"{col}_dayofweek_cos"] = coss[:, 1]
+        new_cols[f"{col}_hour_sin"]      = sins[:, 2]
+        new_cols[f"{col}_hour_cos"]      = coss[:, 2]
+        drop_cols.append(col)
+        log.info("  Parsed date column: '%s' (fmt=%s) → year/month/dow/hour + sin/cos",
+                 col, fmt or "inferred")
+
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+    if new_cols:
+        df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+
+    # ── float32 cast (halves memory, speeds up XGB) ───────────────────────────
+    float_cols = df.select_dtypes(include=["float64"]).columns
+    if len(float_cols):
+        df[float_cols] = df[float_cols].astype("float32")
 
     log.info("  Shape after: %s", df.shape)
-    missing = df.isnull().sum()
-    missing = missing[missing > 0]
-    if not missing.empty:
-        log.info("  Missing values:\n%s", missing)
+    if log.isEnabledFor(logging.DEBUG):
+        missing = df.isnull().sum()
+        missing = missing[missing > 0]
+        if not missing.empty:
+            log.debug("  Missing values:\n%s", missing)
+
+    # ── persist cache ─────────────────────────────────────────────────────────
+    try:
+        df.to_parquet(_cache_file, compression="zstd", index=False)
+        log.info("  Cleaned data cached → %s", _cache_file)
+    except Exception as exc:
+        log.debug("  Cache write skipped: %s", exc)
+
     return df
 
 
 # ── Great Expectations validation ─────────────────────────────────────────────
 
-def validate_data(df: pd.DataFrame) -> None:
+# Phase 3: cache GX context so repeated calls in the same process don't re-init
+_GX_CONTEXT_CACHE: object | None = None
+
+
+def _gx_get_or_add(collection, add_method: str, get_method: str, **kwargs):
+    """Phase 3: DRY helper — try add_*, fall back to get_* on collision."""
+    try:
+        return getattr(collection, add_method)(**kwargs)
+    except Exception:  # noqa: BLE001 — GX raises various internal types
+        return getattr(collection, get_method)(kwargs.get("name", list(kwargs.values())[0]))
+
+
+def validate_data(df: pd.DataFrame, skip: bool = False) -> None:
+    """Phase 3: Great Expectations validation with cached context and skip flag."""
+    if skip:
+        log.info("[2/9] Validation skipped (skip=True).")
+        return
+
     log.info("[2/9] Validating data (Great Expectations)...")
-    context = gx.get_context()
+    global _GX_CONTEXT_CACHE
+    if _GX_CONTEXT_CACHE is None:
+        _GX_CONTEXT_CACHE = gx.get_context()
+    context = _GX_CONTEXT_CACHE
+
     try:
-        data_source = context.data_sources.add_pandas("pandas")
-    except Exception:
-        data_source = context.data_sources.get("pandas")
-    try:
-        data_asset = data_source.add_dataframe_asset(name="train_data")
-    except Exception:
-        data_asset = data_source.get_asset("train_data")
+        data_source = _gx_get_or_add(
+            context.data_sources, "add_pandas", "get", name="pandas"
+        )
+        data_asset = _gx_get_or_add(
+            data_source, "add_dataframe_asset", "get_asset", name="train_data"
+        )
+    except gx.exceptions.DataContextError as exc:
+        log.warning("[2/9] GX context error: %s — skipping validation.", exc)
+        return
+
     batch_def = data_asset.add_batch_definition_whole_dataframe("full_batch")
     batch = batch_def.get_batch(batch_parameters={"dataframe": df})
     rules = []  # ← add Great Expectations expectations here
