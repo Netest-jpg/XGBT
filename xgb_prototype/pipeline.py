@@ -17,7 +17,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import average_precision_score, mean_absolute_error, mean_squared_error, r2_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, PowerTransformer, TargetEncoder
+from sklearn.preprocessing import OneHotEncoder, PowerTransformer, RobustScaler, TargetEncoder
 from xgboost import XGBClassifier, XGBRegressor
 from xgboost import callback as xgb_callback
 
@@ -26,7 +26,8 @@ from .settings import (
     N_ESTIMATORS_MAX, N_ESTIMATORS_MIN, TUNE_N_ESTIMATORS,
     N_TRIALS, OPTUNA_BUDGET_SECONDS, OPTUNA_TIMEOUT,
     PCA_MAX_COMPONENTS, PCA_VARIANCE,
-    RANDOM_STATE, SEARCH_SUBSAMPLE, USE_GPU, WIDE_SEARCH, ENSEMBLE_ENABLED, ENSEMBLE_TOP_K, POWER_TRANSFORM,
+    RANDOM_STATE, SEARCH_SUBSAMPLE, USE_GPU, WIDE_SEARCH, ENSEMBLE_ENABLED, ENSEMBLE_TOP_K,
+    POWER_TRANSFORM, ROBUST_SCALER_COLS,
 )
 from .metrics import MetricConfig
 
@@ -133,18 +134,34 @@ def build_pipeline(
     early_stop: int = EARLY_STOP_RNDS,
     use_pca: bool = False,
 ) -> Pipeline:
-    """Build preprocessor + XGBoost pipeline."""
+    """Build preprocessor + XGBoost pipeline.
+
+    Numerical features are split into two groups:
+      robust_cols — columns in ROBUST_SCALER_COLS (e.g. Amount, Time):
+                    RobustScaler only. Outlier structure carries fraud signal.
+      pca_cols    — all other numerical cols (e.g. V1-V28):
+                    impute + optional PowerTransformer. Already PCA-normalised.
+    """
     params      = params or {}
     tree_method, device = _resolve_tree_method()
 
-    num_steps = [("imputer", SimpleImputer(strategy="median"))]
+    # ── Split numerical cols into robust-scaled vs power-transformed ──────────
+    robust_in_num = [c for c in ROBUST_SCALER_COLS if c in num_cols]
+    pca_cols      = [c for c in num_cols if c not in robust_in_num]
+
+    robust_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler",  RobustScaler()),
+    ])
+
+    pca_steps = [("imputer", SimpleImputer(strategy="median"))]
     if POWER_TRANSFORM:
-        num_steps.append(("power", PowerTransformer(method="yeo-johnson")))
+        pca_steps.append(("power", PowerTransformer(method="yeo-johnson")))
     if use_pca:
         n_comp = PCA_MAX_COMPONENTS if PCA_MAX_COMPONENTS is not None else PCA_VARIANCE
-        num_steps.append(("pca", PCA(n_components=n_comp, random_state=RANDOM_STATE)))
+        pca_steps.append(("pca", PCA(n_components=n_comp, random_state=RANDOM_STATE)))
+    pca_transformer = Pipeline(pca_steps)
 
-    num_transformer = Pipeline(num_steps)
     ohe_transformer = Pipeline([
         ("imputer", SimpleImputer(strategy="most_frequent")),
         ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
@@ -155,9 +172,10 @@ def build_pipeline(
     ])
 
     transformers = []
-    if num_cols:     transformers.append(("num",    num_transformer, num_cols))
-    if ohe_cat_cols: transformers.append(("cat",    ohe_transformer, ohe_cat_cols))
-    if te_cat_cols:  transformers.append(("te_cat", te_transformer,  te_cat_cols))
+    if robust_in_num: transformers.append(("robust", robust_transformer, robust_in_num))
+    if pca_cols:      transformers.append(("num",    pca_transformer,    pca_cols))
+    if ohe_cat_cols:  transformers.append(("cat",    ohe_transformer,    ohe_cat_cols))
+    if te_cat_cols:   transformers.append(("te_cat", te_transformer,     te_cat_cols))
 
     preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
 
@@ -311,17 +329,12 @@ def tune_hyperparameters(
             }
 
         # ── n_estimators: tune directly or rely on early stopping ─────────────
-        # tune_n_estimators=true  → Optuna picks n_estimators (100–N_ESTIMATORS_MAX),
-        #                           no early stopping inside trials (cleaner CV signal).
-        # tune_n_estimators=false → fix at N_ESTIMATORS_MAX + early stopping
-        #                           (original behaviour, useful on datasets where
-        #                            the right tree count is unknown and runtime allows).
         if TUNE_N_ESTIMATORS:
-            trial_n_estimators   = trial.suggest_int("n_estimators", N_ESTIMATORS_MIN, N_ESTIMATORS_MAX)
-            trial_early_stop     = None   # Optuna owns the depth — no early stopping
+            trial_n_estimators = trial.suggest_int("n_estimators", N_ESTIMATORS_MIN, N_ESTIMATORS_MAX)
+            trial_early_stop   = None
         else:
-            trial_n_estimators   = N_ESTIMATORS_MAX
-            trial_early_stop     = EARLY_STOP_RNDS
+            trial_n_estimators = N_ESTIMATORS_MAX
+            trial_early_stop   = EARLY_STOP_RNDS
 
         shared = dict(
             n_estimators          = trial_n_estimators,
@@ -335,22 +348,32 @@ def tune_hyperparameters(
             shared["scale_pos_weight"] = metric.scale_pos_weight
 
         if use_cv:
-            fold_scores: list[float] = []
-            for fold_idx, (tr_idx, vl_idx) in enumerate(cv_splitter.split(X_train_proc, y_train_arr)):
+            # ── Parallel CV folds ─────────────────────────────────────────────
+            # Run all folds concurrently with loky backend.
+            # nthread=1 per XGBoost model avoids nested parallelism contention.
+            def _fit_fold(tr_idx, vl_idx):
                 X_tr_f, X_vl_f = X_train_proc[tr_idx], X_train_proc[vl_idx]
                 y_tr_f, y_vl_f = y_train_arr[tr_idx],  y_train_arr[vl_idx]
-                mdl = XGBClassifier(**shared) if task == "classification" else XGBRegressor(**shared)
-                # eval_set only needed when early stopping is active
+                mdl = XGBClassifier(**{**shared, "nthread": 1}) if task == "classification" \
+                      else XGBRegressor(**{**shared, "nthread": 1})
                 fit_kwargs: dict = {"verbose": False}
                 if trial_early_stop is not None:
                     fit_kwargs["eval_set"] = [(X_vl_f, y_vl_f)]
                 mdl.fit(X_tr_f, y_tr_f, **fit_kwargs)
                 y_pred  = mdl.predict(X_vl_f)
-                y_proba = mdl.predict_proba(X_vl_f)[:, 1] if metric.needs_proba and task == "classification" else None
-                fold_scores.append(metric.score(y_vl_f, y_pred, y_proba))
-                trial.report(np.mean(fold_scores), step=fold_idx)
-                if trial.should_prune():
-                    raise optuna.exceptions.TrialPruned()
+                y_proba = mdl.predict_proba(X_vl_f)[:, 1] \
+                          if metric.needs_proba and task == "classification" else None
+                return metric.score(y_vl_f, y_pred, y_proba)
+
+            splits = list(cv_splitter.split(X_train_proc, y_train_arr))
+            fold_scores = joblib.Parallel(n_jobs=-1, backend="loky")(
+                joblib.delayed(_fit_fold)(tr_idx, vl_idx)
+                for tr_idx, vl_idx in splits
+            )
+            # Pruning not available with parallel folds — report mean at end
+            trial.report(float(np.mean(fold_scores)), step=n_folds - 1)
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
             return float(np.mean(fold_scores))
 
         # Fast-path: stratified subsample (capped at _SUBSAMPLE_ROW_CAP rows)
@@ -376,9 +399,10 @@ def tune_hyperparameters(
     _timeout_label = f"{effective_timeout}s" if effective_timeout is not None else "none"
     _nest_label    = f"tuned({N_ESTIMATORS_MIN}–{N_ESTIMATORS_MAX})" if TUNE_N_ESTIMATORS else f"fixed@{N_ESTIMATORS_MAX}+earlystop"
     log.info("[5/9] Optuna search (%d trials · %s timeout · %d subsample rows · "
-             "metric=%s · cv=%s · wide=%s · n_estimators=%s)...",
+             "metric=%s · cv=%s · wide=%s · n_estimators=%s · parallel_folds=%s)...",
              effective_n_trials, _timeout_label, n_sub,
-             metric.name, n_folds if use_cv else "off", WIDE_SEARCH, _nest_label)
+             metric.name, n_folds if use_cv else "off", WIDE_SEARCH, _nest_label,
+             "yes" if use_cv else "n/a")
     with tqdm(total=effective_n_trials, ncols=100, desc="Optuna search") as pbar:
         def _objective_with_progress(trial):
             result = objective(trial)

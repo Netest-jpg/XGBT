@@ -58,7 +58,8 @@ logging.basicConfig(
     handlers=_handlers,
     force=True,
 )
-
+# Suppress noisy great_expectations startup logs
+logging.getLogger("great_expectations").setLevel(logging.WARNING)
 # ── Core ──────────────────────────────────────────────────────────────────────
 TASK              = _c("task",           "classification")
 TARGET_COL        = _c("target_col",     "Class")
@@ -78,12 +79,12 @@ CV_STRATEGY       = _c("cv_strategy",    "stratified")
 WIDE_SEARCH       = bool(_c("wide_search", False))
 
 N_TRIALS          = _c("n_trials",       50 if WIDE_SEARCH else 30)
-_timeout_cfg      = _c("optuna_timeout", None)    # None = no hard cap; use budget knob instead
+_timeout_cfg      = _c("optuna_timeout", None)
 OPTUNA_TIMEOUT    = None if _timeout_cfg is None else int(_timeout_cfg)
 _budget_cfg       = _c("optuna_budget_seconds", None)
 OPTUNA_BUDGET_SECONDS = None if _budget_cfg is None else int(_budget_cfg)
 SEARCH_SUBSAMPLE  = _c("search_subsample",   0.6)
-N_ESTIMATORS_MAX  = _c("n_estimators_max",   500 if WIDE_SEARCH else 500)
+N_ESTIMATORS_MAX  = _c("n_estimators_max",   500)
 N_ESTIMATORS_MIN  = int(_c("n_estimators_min",  100))
 TUNE_N_ESTIMATORS = bool(_c("tune_n_estimators", True))
 EARLY_STOP_RNDS   = _c("early_stop_rnds",    20)
@@ -118,7 +119,8 @@ USE_GPU               = bool(_c("use_gpu",                False))
 PANDERA_VALIDATION    = bool(_c("pandera_validation",     True))
 METRIC_NAME           = str(_c("metric",                  "auto")).lower()
 CALIBRATION_ENABLED   = bool(_c("calibration_enabled",   True))
-POWER_TRANSFORM = bool(_c("power_transform", True))
+POWER_TRANSFORM         = bool(_c("power_transform", True))
+ROBUST_SCALER_COLS      = list(_c("robust_scaler_cols", ["Amount", "Time"]))
 PRETRANSFORM_LOG1P_COLS = list(_c("pretransform_log1p_cols", []))
 PRETRANSFORM_DROP_COLS  = list(_c("pretransform_drop_cols",  []))
 

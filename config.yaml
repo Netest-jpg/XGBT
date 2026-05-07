@@ -29,8 +29,8 @@ cv_strategy: stratified     # "stratified" | "timeseries"
 
 # ── Optuna ────────────────────────────────────
 n_trials: 30
-optuna_budget_seconds: null   # set to e.g. 300 to enable budget-driven tuning
-optuna_timeout: null        # seconds; null = run all n_trials
+optuna_budget_seconds: null
+optuna_timeout: null
 # ── Search subsample ──────────────────────────────────────────────────────────
 # Fraction of training rows used per trial (fast-path only).
 # Hard-capped at 50k rows in code regardless of this value.
@@ -40,6 +40,7 @@ n_estimators_min: 100        # lower bound when tune_n_estimators: true
 tune_n_estimators: true      # true → Optuna searches n_estimators (no early stopping in trials)
                              # false → early stopping drives n_estimators (original behaviour)
 early_stop_rnds: 20
+robust_scaler_cols: ["Amount", "Time"]   # these cols get RobustScaler; all others get PowerTransformer
 
 # ── PCA ───────────────────────────────────────
 pca_threshold: 999

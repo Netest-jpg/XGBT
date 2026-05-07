@@ -79,6 +79,7 @@ class TrainingConfig:
     n_estimators_min: int = 100
     tune_n_estimators: bool = True
     early_stop_rnds: int = 20
+    robust_scaler_cols: list[str] = field(default_factory=lambda: ["Amount", "Time"])
     pca_threshold: int = 10
     pca_variance: float = 0.95
     pca_max_components: int | float | None = None

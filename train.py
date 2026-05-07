@@ -245,13 +245,13 @@ def main() -> None:
             plot_learning_curve(_lc_pipeline, X_trainval, y_trainval, metric, TASK)
 
         # ── 6. Final fit ──────────────────────────────────────────────────────
-        # When tune_n_estimators=true: Optuna already found best n_estimators,
-        # it lives in best_params — pop it out, fit directly, no early stopping.
-        # When tune_n_estimators=false: use early stopping on train+val to find
-        # best_iteration, then refit at that depth (original behaviour).
+        # tune_n_estimators=true:  n_estimators in best_params from Optuna,
+        #                          fit directly, no early stopping.
+        # tune_n_estimators=false: early stopping finds best_iteration,
+        #                          then refit at exact depth (original behaviour).
         log.info("[6/9] Fitting final pipeline (train+val) with best params...")
 
-        final_params = dict(best_params)   # don't mutate Optuna's dict
+        final_params = dict(best_params)
 
         if TUNE_N_ESTIMATORS:
             best_n = int(final_params.pop("n_estimators", N_ESTIMATORS_MAX))
@@ -271,24 +271,22 @@ def main() -> None:
                 eval_set=[(X_val_proc, y_val)],
                 verbose=False,
             )
-            cb_history    = _refit_cb.history
+            cb_history = _refit_cb.history
         else:
-            # Original early-stopping path
             final_pipeline = build_pipeline(
                 num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, final_params,
                 n_estimators=N_ESTIMATORS_MAX, early_stop=30, use_pca=use_pca,
             )
             preprocessor  = final_pipeline.named_steps["preprocessor"]
             X_tv_proc     = preprocessor.fit_transform(X_trainval, y_trainval)
-            X_val_proc_es = preprocessor.transform(X_val)
-            X_val_proc    = X_val_proc_es   # alias for downstream compatibility
+            X_val_proc    = preprocessor.transform(X_val)
             X_test_proc   = preprocessor.transform(X_test)
 
             _es_model = final_pipeline.named_steps["model"]
             _es_model.set_params(callbacks=[_IterationLogCallback(period=CB_LOG_PERIOD, label="es-fit")])
             _es_model.fit(
                 X_tv_proc, y_trainval,
-                eval_set=[(X_val_proc_es, y_val)],
+                eval_set=[(X_val_proc, y_val)],
                 verbose=False,
             )
             best_n = final_pipeline.named_steps["model"].best_iteration
@@ -306,8 +304,6 @@ def main() -> None:
             _refit_model.set_params(callbacks=[_refit_cb])
             _refit_model.fit(X_tv_proc, y_trainval, verbose=False)
             cb_history = _refit_cb.history
-
-        # ── Calibration ──────────────────────────────────────────────────────
         if TASK == "classification" and CALIBRATION_ENABLED:
             log.info("[6c/9] Calibrating classifier (CalibratedClassifierCV prefit)...")
             raw_xgb = refit_pipeline.named_steps["model"]
