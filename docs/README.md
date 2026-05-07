@@ -1,30 +1,27 @@
 # XGBoost Prototype — Complete Reference
 
-> A generalized, reproducible XGBoost training prototype for tabular classification and regression. Configured entirely through `config.yaml` — new datasets require config changes, not code edits.
+> A generalized, reproducible XGBoost training prototype for tabular classification and regression. Configured through `config.yaml`. New datasets require only config changes, not code edits.
 
 ---
 
 ## Table of Contents
-
-0. [Setup](#0-setup)
+0. [Setup](#setup)
 1. [Project Overview](#1-project-overview)
 2. [Project Layout](#2-project-layout)
 3. [Quick Start](#3-quick-start)
-4. [Using This Template With a New Dataset](#4-using-this-template-with-a-new-dataset)
+4. [Using This Template With a New CSV](#4-using-this-template-with-a-new-csv)
 5. [config.yaml — Complete Reference](#5-configyaml--complete-reference)
 6. [Training Process — Step by Step](#6-training-process--step-by-step)
-7. [Package Modules](#7-package-modules-xgb_prototype)
+7. [Package Modules (`xgb_prototype/`)](#7-package-modules-xgb_prototype)
 8. [Inference and Serving](#8-inference-and-serving)
 9. [Artifacts and Outputs](#9-artifacts-and-outputs)
 10. [Diagnostic Plots](#10-diagnostic-plots)
 11. [Test Suite](#11-test-suite)
-12. [Architecture and Design Decisions](#12-architecture-and-design-decisions)
+12. [Deep-Dive: Architecture and Design Decisions](#12-deep-dive-architecture-and-design-decisions)
 13. [Known Limitations](#13-known-limitations)
-14. [Development Notes](#14-development-notes)
 
 ---
-
-## 0. Setup
+## Setup
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if you don't have it:
 
@@ -32,31 +29,20 @@ Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if you don
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Clone and sync:
+Then clone and install:
 
 ```bash
 git clone https://github.com/Netest-jpg/XGBT.git
 cd XGBT
-uv sync --extra dev
+uv sync --group dev
 ```
-
-Hard dependencies (enforced at startup): `xgboost ≥ 1.7`, `scikit-learn ≥ 1.3`, `numpy ≥ 1.23`, `pandas ≥ 1.5`.
-
-Optional extras:
-
-```bash
-pip install mlflow          # experiment tracking
-pip install pandera         # schema validation
-pip install category_encoders  # TargetEncoder for high-cardinality columns
-```
-
 ---
 
 ## 1. Project Overview
 
-This is a generalized XGBoost training prototype. It supports classification and regression, runs Optuna hyperparameter tuning, compares cheap baselines before committing to a full search, writes versioned model artifacts, generates a full diagnostic plot suite, and exposes stable inference wrappers for both local and production use.
+This project is a generalized XGBoost training prototype. It is configured through `config.yaml`, supports classification and regression, runs Optuna hyperparameter tuning, compares simple baselines, writes versioned model artifacts, generates diagnostics, and exposes stable inference wrappers.
 
-The sample dataset is `creditcard.csv`, but the pipeline is not fraud-specific. The same code runs across tabular datasets by changing `config.yaml`.
+The current sample dataset is `creditcard.csv`, but the code is intentionally not fraud-specific. The same pipeline works across many tabular datasets by changing configuration values rather than editing code.
 
 ---
 
@@ -65,41 +51,43 @@ The sample dataset is `creditcard.csv`, but the pipeline is not fraud-specific. 
 ```text
 .
 ├── config.yaml                  # Main runtime configuration
-├── creditcard.csv               # Example dataset
+├── creditcard.csv               # Example tabular dataset
 ├── pyproject.toml               # Dependencies, dev extras, console script
-├── train.py                     # Entrypoint launcher
+├── train.py                     # Backward-compatible launcher
 ├── uv.lock                      # Locked dependency resolution
-├── docs/
-└── xgb_prototype/
-    ├── __init__.py              # Package exports
-    ├── baselines.py             # Dummy, linear, and default-XGBoost comparisons
-    ├── config.py                # Typed dataclass config loader
-    ├── data.py                  # Data loading, cleaning, drift detection
-    ├── deps.py                  # Hard/soft dependency version checks
-    ├── drift_monitor.py         # Continuous production drift monitoring
-    ├── evaluation.py            # Test-set evaluation, error analysis, threshold tuning
-    ├── features.py              # Type inference, variance filter, interactions, RFECV
-    ├── inference.py             # PredictWrapper and ModelServer
-    ├── metrics.py               # MetricConfig dataclass and auto metric selection
-    ├── pipeline.py              # sklearn Pipeline construction and Optuna tuning
-    ├── plots.py                 # All diagnostic plot functions
-    ├── settings.py              # Module-level constants loaded from config.yaml
-    ├── thresholds.py            # Binary threshold tuning policies
-    ├── tracking.py              # MLflow, requirements lock, registry, run summary
-    └── tests/
-        ├── test_config.py
-        ├── test_data_loading_and_temporal.py
-        ├── test_drift_monitor.py
-        ├── test_feature_inference.py
-        ├── test_serving.py
-        ├── test_smoke_training.py
-        └── test_thresholds.py
+├── docs/                        # Documentation files
+├── xgb_prototype/
+│   ├── __init__.py              # Package exports
+│   ├── baselines.py             # Dummy, linear, and default-XGBoost comparisons
+│   ├── config.py                # Typed dataclass config loader
+│   ├── data.py                  # Data loading and cleaning
+│   ├── deps.py                  # Dependency version checks
+│   ├── drift_monitor.py         # Continuous drift monitoring
+│   ├── evaluation.py            # Test-set evaluation
+│   ├── features.py              # Feature type inference and interactions
+│   ├── inference.py             # PredictWrapper and ModelServer
+│   ├── metrics.py               # MetricConfig and metric selection
+│   ├── pipeline.py              # sklearn Pipeline construction
+│   ├── plots.py                 # Diagnostic plot generation
+│   ├── serving.py               # Stable serving imports
+│   ├── settings.py              # Module-level config constants
+│   ├── thresholds.py            # Binary threshold tuning policies
+│   ├── tracking.py              # MLflow integration
+│   └── train.py                 # Main training orchestration
+└── tests/
+    ├── test_config.py
+    ├── test_data_loading_and_temporal.py
+    ├── test_drift_monitor.py
+    ├── test_feature_inference.py
+    ├── test_serving.py
+    ├── test_smoke_training.py
+    └── test_thresholds.py
 ```
 
-Generated outputs:
+Generated outputs go to:
 
 ```text
-models/     # Joblib artifacts, run JSON, registry, requirements locks, CSVs
+models/     # Joblib artifacts, run JSON, registry, locks, CSVs
 plots/      # Plotly HTML and PNG diagnostics
 ```
 
@@ -107,30 +95,37 @@ plots/      # Plotly HTML and PNG diagnostics
 
 ## 3. Quick Start
 
+Install or sync the project environment:
+
 ```bash
-# Sync environment
-uv sync --extra dev
+uv sync --group dev
+```
 
-# Run training
+Run training:
+
+```bash
 uv run python train.py
+```
 
-# Point to a custom config
-uv run python train.py --config path/to/config.yaml
+Run the fast tests:
 
-# Fast test suite
+```bash
 PYTHONDONTWRITEBYTECODE=1 uv run python -m pytest -q
+```
 
-# End-to-end smoke test (launches actual training)
+Run the opt-in tiny training smoke test:
+
+```bash
 RUN_XGB_PROTOTYPE_SMOKE=1 uv run python -m pytest tests/test_smoke_training.py -q
 ```
 
 ---
 
-## 4. Using This Template With a New Dataset
+## 4. To use this template With a new CSV
 
-### Step 0 — Prepare your data
+### Step 0 — Prepare your CSV
 
-One row per training example, one target column, a header row. Supported formats: `.csv`, `.parquet`, `.json`, `.jsonl`, `.xlsx`, `.xls`, or a glob like `data/monthly_*.csv`.
+Your CSV should have one row per training example, one target column, any number of feature columns, and a header row with column names.
 
 ```csv
 age,income,plan_type,tenure_months,churned
@@ -138,17 +133,29 @@ age,income,plan_type,tenure_months,churned
 52,105000,business,44,1
 ```
 
-### Step 1 — Edit the three required config values
+### Step 1 — Put the CSV somewhere predictable
 
-```yaml
-task: classification        # or: regression
-target_col: churned         # must match exactly
-data_path: data/my_data.csv
+Recommended layout:
+
+```text
+my_project/
+├── data/
+│   └── my_new_dataset.csv
+├── config.yaml
+└── xgb_prototype/
 ```
 
-### Step 2 — Run a fast draft first
+### Step 2 — Edit the three required config values in `config.yaml`
 
-Confirm the dataset loads and the pipeline trains before committing to a full search:
+```yaml
+task: classification        # or regression
+target_col: your_target       # the column you want to predict
+data_path: data/my_new_dataset.csv        # path to your csv
+```
+
+### Step 3 — Run a fast draft first
+
+Confirm the dataset loads and the pipeline trains before tuning:
 
 ```yaml
 cv_folds: 0
@@ -162,7 +169,7 @@ diagnostics:
 uv run python train.py
 ```
 
-### Step 3 — Move to a fuller run
+### Step 4 — Move to a better run
 
 ```yaml
 cv_folds: 5
@@ -172,6 +179,12 @@ diagnostics:
   plots_enabled: true
 ```
 
+### Task type identification
+
+Classification targets: binary flags (`0/1`), yes/no, multi-class labels like `low/medium/high`.
+
+Regression targets: continuous numeric values like `price`, `revenue`, `delivery_time_minutes`.
+
 ### After training, check
 
 ```text
@@ -180,7 +193,7 @@ models/error_analysis_<run_id>.csv        # What high-confidence mistakes did it
 plots/                                    # Feature importance, PR curve, threshold sweep, etc.
 ```
 
-If the tuned model barely beats the dummy baseline: check for data leakage, target quality, or whether the task is learnable from available columns. If logistic regression beats XGBoost, the relationship may be mostly linear or the search needs more trials.
+If the tuned model barely beats the dummy baseline: check data leakage, target quality, feature usefulness, or whether the task is learnable from available columns. If logistic regression beats XGBoost: the relationship may be mostly linear, or the search needs more trials.
 
 ### Common problems
 
@@ -188,14 +201,13 @@ If the tuned model barely beats the dummy baseline: check for data leakage, targ
 |---------|-----|
 | Target column not found | Check `target_col` capitalization |
 | Data path matched no files | Use an absolute path; verify glob pattern |
-| Too slow | Set `cv_folds: 0`, lower `n_trials`, disable plots |
-| Memory issues | Disable permutation importance, lower `target_encoding_threshold` |
-| Poor classification threshold | Try `threshold_policy.mode: f1` or `fbeta` |
-| Regression target skew | Set `target_log_transform: true` if target is strictly positive |
+| Too slow | Set `cv_folds: 0`, lower `n_trials`, disable diagnostics |
+| Memory issues | Disable PCA plots and permutation importance, lower `target_encoding_threshold` |
+| Bad classification threshold | Try `threshold_policy.mode: f1` or `fbeta` |
+| Regression target skew | Try `target_log_transform: true` if target is positive |
 
-### Dataset size tips
+### Large dataset tips
 
-Large datasets:
 ```yaml
 cv_folds: 0
 search_subsample: 0.3
@@ -204,7 +216,8 @@ diagnostics:
   plots_enabled: false
 ```
 
-Small datasets:
+### Small dataset tips
+
 ```yaml
 test_size: 0.2
 cv_folds: 5
@@ -212,7 +225,8 @@ n_trials: 20
 n_estimators_max: 150
 ```
 
-Time-series-like data:
+### Time-series-like data
+
 ```yaml
 cv_strategy: timeseries
 ```
@@ -221,146 +235,159 @@ cv_strategy: timeseries
 
 ## 5. `config.yaml` — Complete Reference
 
-### Task
+`config.yaml` controls the training run. For most new datasets, you only need to change this file.
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `task` | `classification` | `classification` or `regression` |
-| `target_col` | `Class` | Target column name — must match exactly |
-| `test_size` | `0.2` | Fraction held out for final evaluation |
-| `random_state` | `42` | Seed for splits and model behavior |
 
-### Data loading
+
+### Task settings
+
+| Key | Description |
+|-----|-------------|
+| `task` | `classification` or `regression` |
+| `target_col` | Target column name, must match exactly |
+| `test_size` | Fraction held out for final evaluation (default `0.2`) |
+| `random_state` | Seed for reproducible splits and model behavior |
+
+### Path settings
 
 ```yaml
-data_path: creditcard.csv       # path, or glob like data/batch_*.csv
-csv_chunk_size: null            # null = read normally; integer = stream in chunks
-csv_chunk_log_every: 10         # log every N chunks when chunked loading is active
+model_output_dir: models
+plot_output_dir: plots
+data_path: creditcard.csv
+csv_chunk_size: null          # null = read normally; integer = stream in chunks
+csv_chunk_log_every: 10
 ```
 
-`csv_chunk_size` improves progress logging for large files but does not enable true out-of-core training — the full DataFrame is still materialized before training.
+Supported `data_path` formats: `.csv`, `.parquet`, `.json`, `.jsonl`, `.xlsx`, `.xls`, glob patterns like `data/monthly_*.csv`.
 
-### Logging
+`csv_chunk_size` improves CSV ingestion progress logging for large files but does not enable true out-of-core training — the dataframe is still materialized before training begins.
+
+### Logging settings
 
 ```yaml
-log_level: INFO     # DEBUG | INFO | WARNING | ERROR
-log_file: null      # null = console only; path = console + file
+log_level: INFO             # DEBUG | INFO | WARNING | ERROR
+log_file: null              # null = console only; path = console + file
+```
+`log_level`
+- Use `INFO` for normal training.
+- Use `DEBUG` when diagnosing a problem.
+
+`log_file`
+- `null` logs to the console only.
+- A path such as `train.log` writes logs to a file too.
+
+### Cross-validation settings
+
+```yaml
+cv_folds: 5                 # 0 = faster validation-split path
+cv_strategy: stratified     # stratified | timeseries
+```
+`cv_folds`: Number of folds used during Optuna tuning. Use `cv_folds: 0` for a quick first run on a large dataset. Use `cv_folds: 5` for a reliable search.
+
+### Optuna search settings
+
+```yaml
+n_trials: 30        # number of hyperparameter trials.
+
+optuna_timeout: null        # null = run until n_trials; integer = max seconds
+
+search_subsample: 0.6       # used when cv_folds: 0; fraction of training data sampled for faster tuning.
+
+n_estimators_max: 300       # maximum boosting rounds; early stopping can stop before this number.
+
+early_stop_rnds: 20       # stop after this many rounds without validation improvement.
+
+wide_search: false          # true = expanded search ranges
 ```
 
-### Cross-validation
-
+Fast draft run:
 ```yaml
-cv_folds: 5             # -1 = auto (CV if n_rows < 50k), 0 = fast-path subsample, N = force N folds
-cv_strategy: stratified # stratified | timeseries
+n_trials: 5
+cv_folds: 0
+n_estimators_max: 100
 ```
 
-### Optuna search
-
+More serious run:
 ```yaml
-n_trials: 30
-optuna_timeout: null            # null = run all trials; integer = max seconds
-optuna_budget_seconds: null     # unified budget knob; drives timeout + n_trials
-search_subsample: 0.6           # fraction of training rows per trial (fast-path only; hard-capped at 50k)
+n_trials: 50
+cv_folds: 5
 n_estimators_max: 500
-n_estimators_min: 100
-tune_n_estimators: true         # true = Optuna tunes n_estimators; false = early stopping sets it
-early_stop_rnds: 20
-wide_search: false              # true = broader hyperparameter ranges + more trials
 ```
 
-### Metric selection
+### PCA settings
 
 ```yaml
-metric: auto                # auto | roc_auc | auprc | macro_f1 | weighted_f1 | r2
-imbalance_threshold: 0.15   # minority fraction below this → AUPRC preferred over ROC-AUC
+pca_threshold: 10           # enable PCA when numerical column count exceeds this
+pca_variance: 0.95          # target explained variance
+pca_max_components: null    # optional hard limit for number of PCA components
 ```
 
-| Value | When to use |
-|-------|-------------|
-| `auto` | Recommended — code picks based on task and class balance |
+To effectively disable PCA unless there are many numerical features:
+```yaml
+pca_threshold: 1000
+```
+
+### Imbalance and metric settings
+
+```yaml
+imbalance_threshold: 0.15   # minority class ratio below this → use AUPRC
+metric: auto
+```
+
+Supported `metric` values:
+
+| Value | Use when |
+|-------|----------|
+| `auto` | Default — code chooses sensible metric |
 | `roc_auc` | Balanced binary classification |
-| `auprc` | Highly imbalanced binary classification |
+| `auprc` | Very imbalanced binary classification |
 | `macro_f1` | Multiclass where all classes matter equally |
 | `weighted_f1` | Multiclass with class imbalance |
 | `r2` | Regression |
 
-### Feature engineering
+### Feature inference settings
 
 ```yaml
-cardinality_limit: 20               # integer columns with ≤ N unique values → categorical (OHE)
-target_encoding_threshold: 50       # object columns with > N unique values → TargetEncoder
-variance_threshold: 0.0             # drop numerical columns at/below this variance
-interaction_top_k: 10               # top-K correlated numerical pairs → product features
-feature_selection: true             # RFECV before Optuna; can be slow on wide datasets
-robust_scaler_cols: ["Amount", "Time"]   # these columns use RobustScaler; all others use PowerTransformer
-pretransform_log1p_cols: []         # log1p applied before PowerTransformer
-pretransform_drop_cols: []          # dropped before any feature work
+cardinality_limit: 20               # integer columns with ≤ this many unique values → categorical
+
+target_encoding_threshold: 50       # object/category columns above this cardinality → TargetEncoder
 ```
 
-### PCA
+Datetime columns detected during cleaning generate cyclical features: month, day-of-week, and hour sine/cosine pairs.
+
+### Drift settings
 
 ```yaml
-pca_threshold: 999      # enable PCA when numerical column count exceeds this value
-pca_variance: 0.95      # target explained variance
-pca_max_components: null
+drift_alpha: 0.05
+drift_warn_only: true       # false = stop run on detected drift
 ```
 
-Set `pca_threshold: 1000` to effectively disable PCA on most datasets.
-
-### Threshold policy (binary classification only)
+### Feature selection and feature generation
 
 ```yaml
-threshold_policy:
-  mode: auto        # auto | f1 | fbeta | precision_at_recall | recall_at_precision | disabled
-  beta: 1.0         # for fbeta mode
-  min_precision: 0.80
-  min_recall: 0.80
-  n_quantiles: 200
+feature_selection: false    # enables RFECV — can be slow
+variance_threshold: 0.0     # 0.0 drops only perfectly constant columns
+interaction_top_k: 10       # number of correlated numerical pairs → product features
 ```
 
-Examples:
+To make training faster:
+```yaml
+feature_selection: false
+interaction_top_k: 0
+```
+
+### MLflow settings
 
 ```yaml
-# Balanced — maximize F1
-threshold_policy:
-  mode: f1
-
-# Recall-sensitive (e.g. medical screening)
-threshold_policy:
-  mode: fbeta
-  beta: 2.0
-
-# Maintain precision above 90%
-threshold_policy:
-  mode: recall_at_precision
-  min_precision: 0.90
+mlflow_tracking_uri: null               # null = disabled
+mlflow_experiment: xgb_prototype
 ```
 
-### Baselines
-
-```yaml
-baselines:
-  enabled: false
-  include_dummy: true
-  include_linear: true       # LogisticRegression for classification
-  include_default_xgb: true
-```
-
-### Ensemble
-
-```yaml
-ensemble:
-  enabled: false
-  top_k: 3      # number of completed Optuna trials to soft-vote
-```
-
-When enabled, a soft-voting ensemble is fit from the top-K completed trials and saved alongside the best single model.
-
-### Diagnostics
+### Diagnostics settings
 
 ```yaml
 diagnostics:
-  plots_enabled: false    # master switch; false skips all plot generation
+  plots_enabled: true
   optuna_plots: true
   learning_curve: true
   permutation_importance: true
@@ -370,49 +397,88 @@ diagnostics:
   pca_plots: true
 ```
 
-### Runtime
+`plots_enabled` is a master switch. Individual families can also be toggled.
+
+### Threshold policy settings
+
+Applies to binary classification only.
 
 ```yaml
-use_gpu: false              # true attempts CUDA; falls back to CPU with a warning if unavailable
-pandera_validation: false   # infer and run Pandera schema checks
-calibration_enabled: true   # CalibratedClassifierCV on val set after final refit
-callback_log_period: 50     # log XGBoost progress every N rounds
+threshold_policy:
+  mode: auto                # auto | disabled | f1 | fbeta | precision_at_recall | recall_at_precision
+  beta: 1.0
+  min_precision: 0.80
+  min_recall: 0.80
+  n_quantiles: 200
 ```
 
-### Drift detection (train/test)
+Examples:
 
 ```yaml
-drift_alpha: 0.05       # p-value threshold
-drift_warn_only: true   # false = raise ValueError on detected drift
+# Balanced classification
+threshold_policy:
+  mode: f1
+
+# Recall-sensitive (e.g. medical screening)
+threshold_policy:
+  mode: fbeta
+  beta: 2.0
+
+# Keep precision above 90%
+threshold_policy:
+  mode: recall_at_precision
+  min_precision: 0.90
 ```
 
-### Continuous drift monitor (production)
+### Baseline settings
+
+```yaml
+baselines:
+  enabled: true
+  include_dummy: true
+  include_linear: true
+  include_default_xgb: true
+```
+
+### Top-K ensemble settings
+
+```yaml
+ensemble:
+  enabled: false
+  top_k: 3
+```
+
+When enabled, fits a soft-voting ensemble from the top completed Optuna trials and saves it alongside the best single model.
+
+### Runtime settings
+
+```yaml
+use_gpu: false              # true attempts CUDA; falls back to CPU if unavailable
+pandera_validation: true
+callback_log_period: 50     # log XGBoost iteration progress every N rounds
+calibration_enabled: true
+```
+
+### Continuous drift monitor settings
 
 ```yaml
 drift_monitor:
-  enabled: false
+  enabled: true
   persistence: 3                    # consecutive drifting checks before alerting
-  min_feature_drift_ratio: 0.10
-  retrain_feature_ratio: 0.25       # drifting fraction that triggers retrain recommendation
-  retrain_severity: high            # none | low | medium | high
+  min_feature_drift_ratio: 0.10     # minimum drifting feature fraction for a check to count
+  retrain_feature_ratio: 0.25       # drifting feature fraction triggering retrain recommendation
+  retrain_severity: high
 ```
 
-### MLflow
+### Regression-specific setting
 
 ```yaml
-mlflow_tracking_uri: null       # null = disabled; e.g. "http://localhost:5000"
-mlflow_experiment: xgb_prototype
-```
-
-### Regression-specific
-
-```yaml
-target_log_transform: false     # log1p(y) before training; requires y > 0
+target_log_transform: false   # true when task=regression, target strictly positive and heavily skewed
 ```
 
 ### Recommended starting configs
 
-Fast draft:
+Fast classification draft:
 ```yaml
 task: classification
 target_col: target
@@ -425,7 +491,7 @@ diagnostics:
   plots_enabled: false
 ```
 
-Full run:
+Full classification run:
 ```yaml
 task: classification
 target_col: target
@@ -438,7 +504,7 @@ diagnostics:
   plots_enabled: true
 ```
 
-Regression:
+Regression run:
 ```yaml
 task: regression
 target_col: target_value
@@ -453,198 +519,213 @@ n_trials: 50
 
 ## 6. Training Process — Step by Step
 
-### Pipeline flow
+### How to start training
+
+Run command:
+```bash
+uv run python train.py
+```
+
+Both run the same `main()` function in `xgb_prototype/train.py`. The root `train.py` is a thin launcher for backward compatibility.
+
+### High-level pipeline
 
 ```text
 load_data()
   └─ clean_data()
-      └─ apply_pretransforms()
-          └─ validate_data()           [Great Expectations scaffold]
-              └─ validate_pandera()    [Pandera schema]
-                  └─ detect_feature_types()
-                      └─ detect_drift()      [KS / χ²]
-                          └─ filter_low_variance()
-                              └─ generate_feature_interactions()
-                                  └─ [optional: select_features_rfecv()]
-                                      └─ evaluate_baselines()
-                                          └─ tune_hyperparameters()  [Optuna]
-                                              └─ final fit + early stop + refit
-                                                  └─ CalibratedClassifierCV
-                                                      └─ tune_threshold()
-                                                          └─ evaluate()
-                                                              └─ analyse_errors()
-                                                                  └─ plots
-                                                                      └─ joblib.dump()
-                                                                          └─ register_model()
-                                                                              └─ mlflow.log_*()
+      └─ validate_data()           [Great Expectations]
+          └─ validate_pandera()    [Pandera]
+              └─ detect_feature_types()
+                  └─ detect_drift()  [KS / χ²]
+                      └─ filter_low_variance()
+                          └─ generate_feature_interactions()
+                              └─ [optional: select_features_rfecv()]
+                                  └─ evaluate_baselines()
+                                      └─ tune_hyperparameters()  [Optuna]
+                                          └─ final fit + early stop + refit
+                                              └─ CalibratedClassifierCV
+                                                  └─ tune_threshold()
+                                                      └─ evaluate()
+                                                          └─ analyse_errors()
+                                                              └─ plots
+                                                                  └─ joblib.dump()
+                                                                      └─ register_model()
+                                                                          └─ mlflow.log_*()
 ```
 
-Data flows in one direction. Nothing downstream re-touches upstream data — the key design principle that prevents leakage.
+Data flows in one direction. Nothing downstream re-touches upstream data — this is the key design principle that prevents leakage.
 
 ### Stage reference
 
-| Log label | Stage | What happens |
-|-----------|-------|--------------|
-| Bootstrap | — | Run ID (`uuid4().hex[:8]`), timestamp, requirements lock written immediately |
-| `[0/9]` | Config validation | Hard errors (missing target, bad task) caught before any data work |
-| — | Load + clean | CSV/Parquet/JSON/JSONL/Excel/glob; dedup, sentinels, date parsing, cyclical encoding |
-| — | Validation | Great Expectations scaffold (empty by default); Pandera schema inferred from training data |
-| `[3/9]` | Split | Stratified train/val/test (68/12/20%); val handles early stopping, calibration, and threshold tuning only |
-| `[3b/9]` | PCA decision | Enabled when `len(num_cols) > pca_threshold` |
-| `[3c/9]` | Drift detection | KS test (numerical), chi-squared (categorical) — train vs test |
-| `[4/9]` | Feature engineering | Low-variance filter, interaction terms, optional RFECV |
-| `[baseline]` | Baselines | Dummy, logistic regression, default XGBoost scored before Optuna |
-| `[5/9]` | Optuna tuning | TPE sampler, MedianPruner; CV or subsample mode |
-| `[6/9]` | Final fit | Fit with early stopping → record `best_n` → refit at exactly `best_n` |
-| `[6b/9]` | Threshold tuning | Quantile-candidate search on val set predictions |
-| `[6c/9]` | Calibration | `CalibratedClassifierCV` on val set; handles sklearn ≥ 1.6 `FrozenEstimator` |
-| `[7/9]` | Evaluation | Test set used only here — never seen during tuning or calibration |
-| — | Error analysis | FP/FN CSV sorted by confidence (binary classification) |
-| `[8/9]` | Plots | Feature importance, PR curve, ROC, confusion matrix, threshold sweep, PDP, etc. |
-| `[9/9]` | Artifact + registry | `joblib.dump` full dict payload; `model_registry.json` updated; run JSON written |
-| — | MLflow | Skipped silently when `mlflow_tracking_uri: null` |
+| Stage | What happens |
+|-------|--------------|
+| Bootstrap | Run ID (`uuid4().hex[:8]`), timestamp, requirements lock written immediately |
+| Config load | OmegaConf + typed dataclasses from `config.py` |
+| Dependency check | Hard requirements raise `ImportError`; soft requirements warn |
+| Data load | CSV/Parquet/JSON/JSONL/Excel/glob, optional chunked reading |
+| Config validation | Hard errors (missing target, bad task) before any data work begins |
+| Data cleaning | Dedup, sentinel values, string stripping, date parsing, cyclical encoding |
+| Great Expectations | Scaffold validation — empty by default, add rules per project |
+| Pandera validation | Schema inferred from training data; range checks warn, null target hard-fails |
+| Feature type detection | num / OHE-categorical / TargetEncoder-categorical split |
+| PCA decision | Enabled when `len(num_cols) > pca_threshold` |
+| Metric selection | Auto or explicit; `scale_pos_weight` computed for imbalanced binary |
+| Train/val/test split | Stratified for classification; 15% of non-test → val set |
+| Drift detection | KS test (numerical), chi-squared (categorical) |
+| Low-variance filtering | Drops constant/near-constant numerical columns |
+| Interaction features | Product of top-K correlated numerical pairs, train correlations only |
+| Optional RFECV | Lightweight XGBoost; expensive, off by default |
+| Baseline comparison | Dummy, logistic regression, default XGBoost |
+| Optuna tuning | TPE sampler, MedianPruner; CV or subsample mode |
+| Final fit | Fit with early stopping → record `best_n` → refit at exactly `best_n` |
+| Calibration | `CalibratedClassifierCV` on val set; handles sklearn 1.6 `FrozenEstimator` |
+| Threshold tuning | Quantile-candidate search on val set predictions |
+| Held-out evaluation | Test set used only here — never seen during tuning or calibration |
+| Error analysis | FP/FN CSV sorted by confidence, for binary classification |
+| Plot generation | Feature importance, PR curve, ROC, confusion matrix, threshold sweep, etc. |
+| Artifact writing | `joblib.dump` with full dict payload |
+| Registry update | Appended to `models/model_registry.json`; marked `production_ready` or `needs_review` |
+| MLflow logging | Skipped when `mlflow_tracking_uri: null` |
 
-### Key design decisions
+### Key design details
 
-**Three-way split.** The test set is held out completely for final evaluation. The val set handles early stopping, calibration, and threshold tuning. Using val for both calibration and reported metrics would give optimistically biased results.
+**Three-way split:** The test set is held out completely and used only for final evaluation. The val set handles early stopping, calibration, and threshold tuning. If val influenced the threshold and was also used to report metrics, results would be optimistically biased.
 
-**Refit at `best_n`.** Early stopping internally trains up to `N_ESTIMATORS_MAX` trees but only uses `best_n`. Refitting at exactly `best_n` eliminates unused trees, shrinks the artifact, and speeds up inference.
+**Final fit refit:** With early stopping, XGBoost internally trains up to `N_ESTIMATORS_MAX` trees but only uses the best `best_n`. A refit at exactly `best_n` eliminates unused trees, shrinking the artifact and speeding up inference.
 
-**Preprocessor reuse.** The preprocessor is fitted once on `train+val`. The same fitted instance is reused for the refit step — no redundant work and no possibility of leakage from refit data touching the transformer.
+**Preprocessor reuse:** The preprocessor is fitted on `train+val` before early stopping. The same fitted preprocessor is reused for the refit — no re-fitting happens, avoiding redundant computation and any possibility of val-set leakage into the preprocessor.
 
-**Artifact before MLflow.** The joblib artifact is written to disk before any MLflow calls. MLflow failures never cause the artifact to be lost.
+**`nthread=1` on XGBoost:** Prevents XGBoost from spawning its own thread pool inside each Optuna trial. Without this, trial-level and tree-level parallelism fight for threads and cause slowdowns.
 
-**Cyclical encoding for dates.** `sin(2π × x / period)` + `cos(2π × x / period)` encodes time as points on the unit circle so December is near January and hour 23 is near hour 0. Both sin and cos are required because sin alone is not uniquely invertible.
+**Cyclical encoding for dates:** `sin(2π × x / period)` + `cos(2π × x / period)` encodes time components as points on the unit circle. December is then near January, hour 23 near hour 0. Both sin and cos are needed because sin alone is not uniquely invertible.
 
-**AUPRC for imbalanced binary.** ROC-AUC is optimistic on highly imbalanced data — a classifier that never predicts positive can still score ~0.5. AUPRC measures the precision-recall tradeoff where the positive class is rare and matters.
+**AUPRC for imbalanced binary:** ROC-AUC is optimistic for highly imbalanced data — a classifier predicting "never positive" can still score ~0.5. AUPRC measures the precision-recall tradeoff, which is more meaningful when the positive class is rare.
+
+**Artifact written before MLflow:** The joblib artifact is saved first. MLflow failures never cause the artifact to be lost.
 
 ---
 
 ## 7. Package Modules (`xgb_prototype/`)
 
-### `config.py`
+### `__init__.py`
 
-Typed dataclass representations of `config.yaml`. Loads YAML via OmegaConf while staying compatible with older flat configs. Missing nested sections receive defaults; unknown keys are ignored.
-
-Main dataclasses: `TrainingConfig`, `ThresholdPolicyConfig`, `BaselineConfig`, `DiagnosticsConfig`, `EnsembleConfig`, `DriftMonitorConfig`.
-Main functions: `load_config(path)`, `to_plain_dict(config)`.
+Re-exports the main typed config helpers:
 
 ```python
-from xgb_prototype.config import load_config
+from xgb_prototype import load_config
 cfg = load_config("config.yaml")
 ```
 
-### `settings.py`
+### `config.py`
 
-Loads `config.yaml` at import time via OmegaConf and exposes all runtime constants as module-level `ALL_CAPS` names. The `_c(key, default)` helper wraps `OmegaConf.select` so every read is fault-tolerant when OmegaConf is absent. Output directories are created at import time so they always exist before any write, even when the module is imported for inference only.
+Typed dataclass representations of `config.yaml`. Loads YAML while remaining compatible with older flat configs. Converts config dataclasses to plain dicts for JSON artifacts.
 
-### `deps.py`
+Main dataclasses: `ThresholdPolicyConfig`, `BaselineConfig`, `DiagnosticsConfig`, `TrainingConfig`.
+Main functions: `load_config(path)`, `to_plain_dict(config)`.
 
-Checks hard and soft dependency versions at import time. Hard failures raise `ImportError` with an explicit `pip install` fix message. Soft failures log a warning. The check is skipped gracefully if `packaging` is not installed.
-
-### `data.py`
-
-Multi-format data loading (CSV/Parquet/JSON/JSONL/Excel/glob), chunked CSV reading, deduplication, sentinel replacement, date parsing with cyclical encoding, Great Expectations scaffold validation, Pandera schema inference and checking, train/test drift detection (KS + chi-squared), pretransform hooks, and optional log-transform for regression targets.
-
-### `features.py`
-
-Feature type inference (numerical / OHE-categorical / TargetEncoder-categorical), low-variance filtering via `VarianceThreshold`, pairwise interaction feature generation (top-K by Pearson |r|), and optional RFECV feature selection using a lightweight XGBoost (cv=3, 100 trees, depth=3).
-
-### `pipeline.py`
-
-Builds the sklearn `Pipeline`:
-
-```text
-"num" branch  → SimpleImputer(median) → [RobustScaler or PowerTransformer(yeo-johnson)] → [PCA]
-"cat" branch  → SimpleImputer(mode)   → OneHotEncoder(handle_unknown="ignore")
-"te"  branch  → TargetEncoder
-                   └─ XGBClassifier / XGBRegressor
-```
-
-Also contains `tune_hyperparameters` (Optuna TPE sampler + MedianPruner, CV or subsample mode), `build_top_k_ensemble` (soft-voting from top Optuna trials), and `_IterationLogCallback` for periodic round logging.
-
-### `metrics.py`
-
-`MetricConfig` dataclass (name, direction, `needs_proba`, `scale_pos_weight`, `eval_metric`) and `select_metric()` for automatic selection. Binary: ROC-AUC when balanced, AUPRC when imbalanced. Multiclass: macro-F1 when balanced, weighted-F1 when skewed.
+Missing nested sections receive defaults. Unknown keys are ignored rather than breaking the run.
 
 ### `thresholds.py`
 
-Generic binary threshold tuning. Builds quantile-spaced candidate thresholds from predicted probabilities and scores each under a named policy (F1, Fβ, precision-at-recall, recall-at-precision, or disabled).
+Generic binary classification threshold tuning. Keeps threshold logic configurable instead of hard-coding domain-specific behavior.
+
+Main dataclass: `ThresholdResult`.
+Main functions: `normalize_policy(policy, metric_name)`, `tune_binary_threshold(y_true, y_proba, policy, metric_name)`.
+
+Algorithm: build candidate thresholds from prediction-probability quantiles (`n_quantiles=200`) → score each candidate → select best per policy.
 
 ```python
 from xgb_prototype.thresholds import tune_binary_threshold
 
 result = tune_binary_threshold(
     y_true, y_proba,
-    policy={"mode": "fbeta", "beta": 2.0},
+    {"mode": "fbeta", "beta": 2.0},
     metric_name="auprc",
 )
-print(result.threshold, result.metrics)
+print(result.threshold)
 ```
-
-### `evaluation.py`
-
-`evaluate()` — full test-set scoring (classification report, confusion matrix, AUPRC, ROC-AUC for classification; RMSE, MAE, R² for regression).
-`tune_threshold()` — val-set threshold search using the configured policy.
-`analyse_errors()` — FP/FN CSV with confidence and margin scores for binary classification.
 
 ### `baselines.py`
 
-Fits cheap baselines (dummy, logistic regression, default XGBoost) before Optuna and saves a comparison CSV to `models/baseline_comparison_<run_id>.csv`. Baseline errors are caught and written as error rows rather than crashing the run.
+Trains and evaluates cheap baseline models before the tuned XGBoost. Produces a comparison table.
 
-### `plots.py`
+Main function: `evaluate_baselines(...)`.
 
-All diagnostic plot functions. Produces interactive Plotly HTML files and static PNGs in `PLOT_OUTPUT_DIR`. Respects the `diagnostics.*` flags from config — unset flags skip specific plot families without failing the run.
+Classification baselines: `dummy_most_frequent`, `logistic_regression`, `xgb_default`.
+Regression baselines: `dummy_mean`, `xgb_default`.
 
-### `tracking.py`
-
-`_MLflowRun` — context manager wrapping an MLflow run; no-ops gracefully when MLflow is absent or the URI is unset.
-`write_requirements_lock` — captures all installed package versions at startup to `requirements_<run_id>.txt`.
-`register_model` — appends run metadata to `model_registry.json`.
-`train_summary` — human-readable log table and machine-readable JSON run report.
+Output: `models/baseline_comparison_<run_id>.csv`. Baseline errors are captured into result rows rather than crashing the run.
 
 ### `drift_monitor.py`
 
-`ContinuousDriftMonitor` for production-time drift monitoring. Compares incoming batches against training reference distributions (KS for numerical, chi-squared for categorical). Alerts only after `persistence` consecutive drifting checks to reduce false positives from single anomalous batches. Embedded in the `.joblib` artifact for deployment use.
+Reusable continuous drift monitor comparing future data batches against training reference distributions. Raises alerts only when drift persists across multiple checks.
 
-### `inference.py`
+Main classes: `ContinuousDriftMonitor`, `DriftCheckResult`.
 
-`PredictWrapper` — thin local wrapper providing LabelEncoder decoding, unseen-category warnings (OHE silently outputs all-zeros for these), and log-untransform for regression targets.
+Uses KS tests for numerical features and chi-squared for categorical. The monitor is embedded in the model artifact and can be used post-deployment:
 
-`ModelServer` — production wrapper adding input validation (missing/extra column reporting), a standardised JSON response envelope, and descriptive error messages on failure. Designed to wrap in FastAPI, Flask, or similar.
+```python
+artifact = joblib.load("models/model_<timestamp>_<run_id>.joblib")
+monitor = artifact["drift_monitor"]
+result = monitor.check(new_batch_df)
+
+print(result.alert)
+print(result.retraining_recommended)
+print(result.recommendation)
+```
+
+### `serving.py`
+
+Stable public inference imports. Provides a fixed import path independent of internal refactoring.
+
+```python
+from xgb_prototype.serving import PredictWrapper, ModelServer
+```
+
+### `train.py`
+
+Main training orchestration. Contains `main()`, pipeline construction, Optuna tuning, evaluation, artifact writing, registry updates, and the `PredictWrapper` / `ModelServer` classes.
+
+Edit this file when changing the core training sequence, preprocessing, model construction, Optuna tuning, final artifact contents, or diagnostics.
 
 ---
 
 ## 8. Inference and Serving
 
-### Local / notebook
+### `PredictWrapper`
+
+The raw `pipeline.predict()` returns integer-encoded labels when a `LabelEncoder` was used. `PredictWrapper` inverts this transparently and warns when unseen categories are encountered at inference time (OHE will encode them as all-zeros).
 
 ```python
 import joblib
-from xgb_prototype.inference import PredictWrapper
+from xgb_prototype.serving import PredictWrapper
 
 artifact = joblib.load("models/model_<timestamp>_<run_id>.joblib")
 model = PredictWrapper(artifact)
 
-labels = model.predict(new_df)                           # decoded class labels
-probas = model.predict_proba(new_df)                     # calibrated probabilities
-preds  = model.predict_with_threshold(new_df)            # apply tuned threshold
+labels = model.predict(new_df)
+probas = model.predict_proba(new_df)
+preds  = model.predict_with_threshold(new_df)          # uses tuned threshold
 custom = model.predict_with_threshold(new_df, threshold=0.3)
 ```
 
-### Production API
+### `ModelServer`
+
+`PredictWrapper` plus input validation and a JSON response envelope. Designed for wrapping in FastAPI, Flask, etc.
 
 ```python
-from xgb_prototype.inference import ModelServer
+import joblib
+from xgb_prototype.serving import ModelServer
 
+artifact = joblib.load("models/model_<timestamp>_<run_id>.joblib")
 server = ModelServer(artifact)
 
-response      = server.predict(new_df)        # returns dict
-json_response = server.predict_json(new_df)   # returns JSON string
-metadata      = server.info()                 # model version, features, eval metrics
+response      = server.predict(new_df)
+json_response = server.predict_json(new_df)
+metadata      = server.info()
 ```
 
-Input validation: coerces `dict → DataFrame`, validates non-empty input, raises `ValueError` with an explicit list of missing columns, warns and ignores extra columns.
+Input validation: coerces `dict` → `DataFrame`, checks for empty input, reports exactly which columns are missing (raises `ValueError`) or extra (warns and ignores). Missing required columns are always a bug; extra columns (audit fields, metadata) are common and harmless.
 
 Response envelope:
 
@@ -660,20 +741,6 @@ Response envelope:
   "positive_proba": [0.09, "..."],
   "warnings": []
 }
-```
-
-### Continuous drift monitoring (post-deployment)
-
-The `ContinuousDriftMonitor` is embedded in the `.joblib` artifact and ready to use after loading:
-
-```python
-monitor = artifact["drift_monitor"]
-result  = monitor.check(new_batch_df)
-
-print(result.severity)                # "none" | "low" | "medium" | "high"
-print(result.alert)                   # True after N consecutive drifting batches
-print(result.retraining_recommended)
-print(result.recommendation)         # human-readable action string
 ```
 
 ---
@@ -701,107 +768,111 @@ The artifact is a Python dict:
 | `use_pca` | `bool` | Whether PCA was applied |
 | `metric` | `MetricConfig` | Metric used for tuning |
 | `label_encoder` | `LabelEncoder\|None` | For decoding integer labels |
-| `known_categories` | `dict[str, set]` | Training-time category sets per column |
+| `known_categories` | `dict[str, set]` | Training-time category sets |
 | `eval_metrics` | `dict` | Test-set evaluation results |
-| `baseline_results` | `list[dict]` | Baseline model comparison rows |
+| `baseline_results` | `list[dict]` | Baseline model comparison |
 | `ensemble_summary` | `dict` | Top-K ensemble results |
 | `drift_report` | `dict` | Train/test drift statistics |
-| `drift_monitor` | `ContinuousDriftMonitor\|None` | Embedded production drift monitor |
-| `threshold_policy` | `dict` | Threshold policy config snapshot |
-| `feature_schema` | `dict` | Column lists + `use_pca` flag |
-| `artifact_paths` | `dict` | Paths to all saved files from this run |
+| `drift_monitor` | `ContinuousDriftMonitor\|None` | Production drift monitor |
+| `threshold_policy` | `dict` | Threshold policy config |
+| `feature_schema` | `dict` | Column lists + use_pca flag |
+| `artifact_paths` | `dict` | Paths to all saved files |
 | `config` | `dict` | Full config snapshot |
 | `run_id` | `str` | 8-character hex run identifier |
 | `timestamp` | `str` | `%Y%m%d_%H%M%S` |
 | `log_transformed` | `bool` | Whether target was log1p-transformed |
-| `cb_history` | `list[dict]` | Per-round train/val metrics from callback |
+| `cb_history` | `list[dict]` | Per-round train/val metrics |
 
 ### Other output files
 
 ```text
-models/run_<timestamp>_<run_id>.json              # Machine-readable run report
+models/run_<timestamp>_<run_id>.json              # Run summary
 models/model_registry.json                        # Persistent registry of all runs
-models/requirements_<run_id>.txt                  # Pinned environment snapshot
+models/requirements_<run_id>.txt                  # Installed package versions at run time
 models/baseline_comparison_<run_id>.csv           # Baseline model scores
 models/error_analysis_<run_id>.csv                # FP/FN analysis (binary classification only)
-models/ensemble_<timestamp>_<run_id>.joblib       # Top-K ensemble (if enabled)
 ```
 
 ### Model registry
 
-`model_registry.json` is a JSON array, newest run last. Each run is marked `production_ready` or `needs_review` based on conservative defaults:
-
-- Classification: ROC-AUC ≥ 0.80 **and** AUPRC ≥ 0.50 → `production_ready`
+`model_registry.json` is a JSON array, newest run last. Each run is marked `production_ready` or `needs_review` based on conservative thresholds:
+- Classification: ROC-AUC ≥ 0.80 AND AUPRC ≥ 0.50 → `production_ready`
 - Regression: R² ≥ 0.70 → `production_ready`
 
-These thresholds should be adjusted per use case.
+These thresholds are defaults and should be tuned per use case.
 
 ### Error analysis CSV
 
-For binary classification, misclassified test samples are saved with: `true_label`, `pred_label`, `error_type` (FP or FN), `confidence`, `margin` (|probability − threshold|), `raw_proba`, and all original feature values. Sorted by confidence descending — high-confidence mistakes appear first.
+For binary classification, misclassified test samples are saved with columns: `true_label`, `pred_label`, `error_type` (FP or FN), `confidence`, `margin` (|probability − threshold|), `raw_proba`, and all original feature values. Sorted by confidence descending — the most actionable errors (high-confidence mistakes) appear first.
 
 ---
 
 ## 10. Diagnostic Plots
 
-All plots are interactive Plotly HTML files in `plots/`, except `pca_2d.png` which is a static matplotlib PNG. HTML files embed Plotly via CDN to keep file sizes small.
+All plots are interactive Plotly HTML files in `plots/`, except `pca_2d.png` which is a static matplotlib PNG. Each HTML file embeds Plotly via CDN to keep file sizes small.
 
-| File | What it shows |
-|------|---------------|
+| Plot file | What it shows |
+|-----------|---------------|
 | `pr_curve.html` | Precision-recall curve with AUPRC and operating point |
 | `roc_curve.html` | ROC curve with AUC |
 | `confusion_matrix.html` | Heatmap of TP/FP/TN/FN |
 | `residuals.html` | Predicted vs actual + residual distribution (regression) |
 | `feature_importance.html` | XGBoost gain importance, top 20 features |
-| `permutation_importance.html` | Model-agnostic importance on test set |
+| `permutation_importance.html` | Model-agnostic permutation importance on test set |
 | `learning_curve.html` | Train vs val score as a function of training set size |
-| `threshold_sweep.html` | Precision, recall, F1 across threshold values |
+| `threshold_sweep.html` | Precision, recall, F1 as a function of threshold |
 | `optuna_history.html` | Optuna optimization history |
 | `optuna_importance.html` | Hyperparameter importance from Optuna |
 | `pca_scree.html` | Explained variance per PCA component |
 | `pca_2d.png` | 2D scatter of first two PCs, colored by label |
-| `pca_3d.html` | Interactive 3D scatter of first three PCs (downsampled to 10k pts) |
+| `pca_3d.html` | Interactive 3D scatter of first three PCs (downsampled to 10,000 pts) |
 | `corr_heatmap.html` | Feature correlation matrix |
-| `calibration_curve.html` | Reliability diagram: calibrated vs uncalibrated probabilities |
+| `shap_summary.html` | SHAP beeswarm plot |
+| `shap_interactions.html` | SHAP interaction values |
+| `calibration_curve.html` | Reliability diagram (calibrated vs uncalibrated) |
 | `outlier_report.html` | IsolationForest anomaly scores |
-| `pdp_*.html` | Partial dependence + ICE plots for top-N features by gain |
+| `pdp_*.html` | Partial dependence + ICE plots |
 
 ---
 
 ## 11. Test Suite
 
-### Running tests
+### How to run
 
+Fast test suite (runs on every save):
 ```bash
-# Full fast suite
 PYTHONDONTWRITEBYTECODE=1 uv run python -m pytest -q
+```
 
-# Single file
+Single file:
+```bash
 PYTHONDONTWRITEBYTECODE=1 uv run python -m pytest tests/test_thresholds.py -q
+```
 
-# Opt-in smoke test (launches actual training on a tiny synthetic dataset)
+Opt-in training smoke test:
+```bash
 RUN_XGB_PROTOTYPE_SMOKE=1 uv run python -m pytest tests/test_smoke_training.py -q
 ```
 
 ### What each file covers
 
-**`test_config.py`** — config loading, backward compatibility with flat YAML, nested section parsing, `to_plain_dict()` serialization.
+**`test_config.py`** — config loading, backward compatibility with flat YAML files, nested section parsing, `to_plain_dict()` serialization.
 
-**`test_thresholds.py`** — `fbeta` choosing a recall-heavy threshold, `disabled` returning 0.5, `auto` normalizing to `f1` for AUPRC. Tests `normalize_policy` and `tune_binary_threshold`.
+**`test_thresholds.py`** — `fbeta` policy choosing a recall-heavy threshold, `disabled` returning 0.5, `auto` normalizing to `f1` for AUPRC. Tests `normalize_policy` and `tune_binary_threshold`.
 
-**`test_feature_inference.py`** — float columns → numerical, low-cardinality integers → OHE, object columns → categorical, imbalanced binary → AUPRC, `scale_pos_weight` computation. Tests `detect_feature_types` and `select_metric`.
+**`test_feature_inference.py`** — float columns → numerical, low-cardinality integers → OHE categorical, object columns → categorical, imbalanced binary → AUPRC, `scale_pos_weight` computation. Tests `detect_feature_types` and `select_metric`.
 
 **`test_serving.py`** — `ModelServer` with a fake pipeline and minimal artifact dict; validates response envelope shape and that missing required columns raise `ValueError`.
 
-**`test_smoke_training.py`** — end-to-end subprocess run on a tiny synthetic dataset with minimal config. Confirms the entrypoint writes a `.joblib` artifact and a run JSON. Skipped by default.
+**`test_smoke_training.py`** — end-to-end subprocess run on a tiny synthetic dataset with minimal config. Confirms the package entrypoint writes a `.joblib` artifact and a run JSON. Skipped by default because it launches an actual training run.
 
-**`test_data_loading_and_temporal.py`** — data loading and datetime feature generation.
+**`test_data_loading_and_temporal.py`** — data loading and date/time feature generation.
 
-**`test_drift_monitor.py`** — `ContinuousDriftMonitor` behavior, alert persistence, severity thresholds.
+**`test_drift_monitor.py`** — `ContinuousDriftMonitor` behavior.
 
-### Good testing patterns
+### Good testing patterns for this project
 
-Use small synthetic DataFrames:
+Use small synthetic DataFrames for unit tests:
 ```python
 df = pd.DataFrame({
     "amount": [10.0, 20.0, 30.0],
@@ -810,86 +881,158 @@ df = pd.DataFrame({
 })
 ```
 
-Use `tmp_path` for config files and output directories. Use fake pipelines for serving tests so they stay fast. Only use the smoke test to verify the full training command.
+Use `tmp_path` for config files and output folders. Use fake pipelines for serving tests so they stay fast. Only use the smoke test when verifying the whole training command still works.
 
-Not yet deeply covered: full Optuna search quality, all plot generation functions, MLflow integration, Pandera failure modes, GPU fallback, regression end-to-end, multiclass end-to-end.
+### What is not yet deeply covered
+
+Full Optuna search quality, all plot generation functions, MLflow integration, Great Expectations rules, Pandera failure modes, GPU fallback behavior, RFECV behavior, target encoding on high-cardinality columns, regression end-to-end training, multiclass end-to-end training.
 
 ### When to add tests
 
-Add or update tests when changing: config keys or defaults, metric selection logic, feature inference rules, threshold policy behavior, artifact structure, serving response shape, model registry format, entrypoint behavior, or preprocessing logic.
+Add or update tests when changing: config keys or defaults, metric selection behavior, feature inference rules, threshold policy behavior, artifact structure, serving response shape, model registry format, train entrypoint behavior, preprocessing logic.
 
 ---
 
-## 12. Architecture and Design Decisions
+## 12. Deep-Dive: Architecture and Design Decisions
+
+This section explains the *why* behind non-obvious implementation choices.
 
 ### Module bootstrapping
 
-`parse_known_args()` instead of `parse_args()` so the `--config` parser silently ignores unrecognized arguments from pytest, Jupyter, or other callers. The `_c(key, default)` helper wraps `OmegaConf.select` to make every config read fault-tolerant when OmegaConf is absent. `MODEL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)` is called at import time so output directories always exist before any write, even when the module is imported for inference only.
+`parse_known_args()` is used instead of `parse_args()` so the `--config` parser silently ignores unrecognized arguments from pytest, Jupyter, or other tools that call the script as a module.
 
-### Data loading
+The `_c(key, default)` helper wraps `OmegaConf.select` to make every config read fault-tolerant. If OmegaConf is absent, it returns the Python literal default without raising.
 
-`sorted(glob.glob(path))` ensures deterministic concatenation order (alphabetical) when multiple files match a glob. Chunked CSV reading streams batches into a list and concatenates at the end — avoids single-chunk peak RAM during the read, but still materializes the full DataFrame before training begins.
+Module-level constants are read once at import time. They use all-caps naming to signal they are not modified after initialization.
 
-### Data cleaning
+`CSV_CHUNK_SIZE = None if _csv_chunk_size_cfg in (None, "null", 0) else int(...)` — YAML `null`, Python `None`, and integer `0` all mean "don't chunk," and OmegaConf may return the string `"null"` for unset keys.
 
-`dropna(how="all")` only drops rows where every value is NaN; partial missingness is kept because it may carry signal. Sentinel replacement covers `-999, -9999, "N/A", "n/a", "NA", "none", "None", ""` — common survey and legacy system conventions. Date detection looks for `"date"` or `"time"` in the column name and a >50% parse success rate to avoid false positives; raw date columns are replaced with year, month, day-of-week, hour, and cyclical sin/cos pairs.
+`MODEL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)` is called at module load time so output directories always exist before any function tries to write to them, even when the module is imported for inference only.
 
-### Feature type detection
+### Data loading (`load_data`)
 
-All-NaN columns are dropped before building column lists. Integer columns with ≤ `cardinality_limit` unique values are routed to OHE (e.g. `num_rooms` with values 1–8 is better as binary features than assuming a linear relationship). Object columns above `target_encoding_threshold` cardinality use `TargetEncoder` — one-hot encoding thousands of unique values would create an unmanageable feature space.
+`sorted(glob.glob(path))` ensures deterministic concatenation order (alphabetical by filename) when multiple files match a glob. Without sorting, the order would depend on filesystem metadata.
 
-### Pipeline construction
+Chunked CSV reading streams batches into a list and concatenates at the end. This avoids single-chunk peak RAM during the read but still materializes the full DataFrame before training.
 
-`PowerTransformer(yeo-johnson)` instead of `StandardScaler`: XGBoost doesn't require feature scaling, but Yeo-Johnson brings skewed features closer to Gaussian, which benefits PCA and interaction feature quality. `SimpleImputer(median)` is robust to outliers in skewed distributions. `OneHotEncoder(handle_unknown="ignore")` outputs all-zeros for unseen categories at inference rather than raising — essential for production. `nthread=1` on XGBoost prevents the model from spawning its own thread pool inside each Optuna trial; outer trial-level parallelism handles concurrency.
+### Data cleaning (`clean_data`)
 
-### Calibration
+`dropna(how="all")` only drops rows where every value is NaN — rows with partial missingness are kept because they may carry useful signal (missingness itself can be informative). `drop_duplicates()` runs after because all-NaN rows cannot contain useful duplicates.
 
-XGBoost's raw `predict_proba` is not well-calibrated — a score of 0.8 does not reliably mean 80% empirical probability. `cv="prefit"` (sklearn < 1.6) and `FrozenEstimator` (sklearn ≥ 1.6) both treat the XGBoost model as already fitted and train only the isotonic/sigmoid layer on top, using the val set the model has not seen during tree construction.
+Sentinel replacement covers `-999, -9999, "N/A", "n/a", "NA", "none", "None", ""` — common survey and legacy system conventions. Domain-specific sentinels (e.g. `99`, `9999`) need to be added per project.
 
-### Drift detection (train/test)
+Date auto-detection looks for `"date"` or `"time"` in the column name (case-insensitive) and a `> 0.5` parse success rate to avoid false positives. Once parsed, the raw column is dropped and replaced with year, month, day-of-week, hour, and cyclical sin/cos pairs for month, day-of-week, and hour.
 
-`detect_drift` compares train and test splits from the same dataset. On random splits this mostly measures sampling variance. The intended use is when train and test come from different time periods or sources — interpret cautiously on standard random splits. The `ContinuousDriftMonitor` handles production-time monitoring separately and independently.
+### Feature type detection (`detect_feature_types`)
 
-### Interaction features
+All-NaN columns are dropped before building the column lists because they provide zero information and cause sklearn transformers to produce NaN-contaminated outputs.
 
-Pearson correlation is computed on training data only → upper triangle of unique pairs (since `corr(A,B) == corr(B,A)`) → sort by |r| descending → top-K with |r| ≥ 0.05 → add `A × B` product features. The 0.05 |r| floor is heuristic and avoids adding pure noise; it misses non-linear relationships (Spearman or mutual information would be more robust).
+Integer columns with ≤ `cardinality_limit` unique values are treated as categorical (OHE). An integer like `num_rooms` (values 1–8) is better as OHE binary features than assuming a linear 1→8 relationship. Object columns above `target_encoding_threshold` cardinality use `TargetEncoder` — one-hot encoding 10,000 unique values would create 10,000 features.
 
-### GPU resolution
+### Pipeline construction (`build_pipeline`)
 
-Three-probe strategy in order: `cupy` import → `torch.cuda.is_available()` → `nvidia-smi` subprocess. First success stops the chain. XGBoost 2.0 uses `device='cuda'` and deprecated `tree_method='gpu_hist'`; a version check ensures compatibility with both 1.x and 2.x. If `use_gpu: true` but no GPU is detected, training falls back to CPU with a warning rather than raising.
+```
+"num" branch  → SimpleImputer(median) → PowerTransformer(yeo-johnson) [→ PCA if use_pca]
+"cat" branch  → SimpleImputer(most_frequent) → OneHotEncoder(handle_unknown="ignore")
+"te"  branch  → TargetEncoder
+```
+
+`PowerTransformer` instead of `StandardScaler`: XGBoost doesn't require feature scaling, but Yeo-Johnson brings skewed features closer to Gaussian, which helps PCA and improves the quality of interaction features.
+
+`SimpleImputer(strategy="median")`: robust to outliers in skewed financial data. Mean imputation would be pulled toward extremes.
+
+`OneHotEncoder(handle_unknown="ignore")`: outputs all-zeros for unseen categories at inference rather than raising. Essential for production. `sparse_output=False` returns a dense array, required by XGBoost.
+
+`nthread=1`: prevents XGBoost from spawning its own thread pool inside each Optuna trial. The outer `study.optimize(n_jobs=-1)` handles trial-level parallelism; XGBoost's thread pool would cause oversubscription.
+
+`n_jobs=-1` on `ColumnTransformer`: parallelises the num/cat/te branches across CPU cores, the dominant source of speedup during Optuna trials.
+
+### Optuna tuning (`tune_hyperparameters`)
+
+Two modes: `cv_folds > 0` uses cross-validation (slower, lower variance); `cv_folds = 0` uses a stratified subsample of the training data (faster, noisier). The subsample mode is sufficient for ranking parameter combinations — it does not need to measure exact performance.
+
+TPE sampler with `n_startup_trials=10`: the first 10 trials use random search to seed the TPE model, preventing it from getting trapped in a bad early configuration.
+
+MedianPruner with `n_warmup_steps=10`: terminates trials performing significantly below the median. The 10-step warmup lets each trial produce a meaningful early score before pruning decisions.
+
+`n_jobs=-1` for subsample mode, `n_jobs=1` for CV mode: parallel trials with inner CV fold parallelism causes thread contention.
+
+### Final fit / refit (`main` steps 6–6b)
+
+1. Train on `train+val` with early stopping, using val as the eval set. Record `best_n`.
+2. Build a fresh pipeline with `n_estimators=best_n` and `early_stop=0`.
+3. Reuse the already-fitted preprocessor (no redundant fitting, no leakage).
+4. Refit on `train+val` at exactly `best_n` — eliminates unused trees, shrinks the artifact, speeds up inference.
+
+### Calibration (`CalibratedClassifierCV`)
+
+XGBoost's raw `predict_proba` is not well-calibrated — a score of 0.8 does not reliably mean 80% probability. Calibration adjusts probabilities to better reflect empirical frequencies.
+
+`cv="prefit"` (sklearn < 1.6) / `FrozenEstimator` (sklearn ≥ 1.6): in both cases the XGBoost model is treated as already fitted and only the sigmoid/isotonic layer is fitted on top. Calibration is fit on the val set, which the model has not seen during tree construction.
+
+### Threshold tuning (`tune_threshold`)
+
+The search evaluates `n_quantiles` candidates spaced as quantiles of the predicted probability distribution. This is faster than a dense grid over [0, 1] and focuses candidates where the actual probability mass is.
+
+The default F1 at threshold 0.5 is logged alongside the tuned threshold so the practitioner can see exactly how much threshold tuning helped.
+
+### Drift detection
+
+`detect_drift` compares train vs test splits from the *same* dataset. For datasets randomly split, this measures natural sampling variance and will rarely flag drift. The intended use is when train and test come from different time periods or data sources. Interpret results cautiously on standard random splits.
+
+The `ContinuousDriftMonitor` (separate from `detect_drift`) handles production-time drift monitoring on incoming batches.
+
+### Interaction features (`generate_feature_interactions`)
+
+Compute Pearson correlation on training data only → upper triangle of unique pairs → sort by |r| descending → select top-K with |r| ≥ 0.05 → add `A × B` features.
+
+Only the upper triangle is used because `corr(A,B) == corr(B,A)`. Products are computed on original (potentially NaN) columns so missingness is inherited naturally. The 0.05 |r| floor avoids adding pure noise interactions, though this threshold is heuristic.
+
+### GPU resolution (`_resolve_tree_method`)
+
+Three-probe strategy: `cupy` → `torch.cuda.is_available()` → `nvidia-smi` subprocess. Tries in order; first success stops the chain. Robust across different CUDA stack configurations.
+
+XGBoost 2.0 introduced `device='cuda'` and deprecated `tree_method='gpu_hist'`. The version check ensures compatibility with both 1.x and 2.x.
+
+Soft fallback: if `use_gpu: true` but no GPU is detected, training falls back to CPU with a warning rather than raising.
 
 ---
 
 ## 13. Known Limitations
 
-**Chunked CSV: no true streaming.** `load_data` still materializes the full DataFrame in memory. For datasets larger than available RAM, a Dask-based approach would be required.
+**Single-file monolith (partially addressed):** `train.py` was previously ~3,800 lines. The codebase has been refactored into sub-modules (`data.py`, `features.py`, `metrics.py`, `pipeline.py`, `plots.py`, `evaluation.py`, `inference.py`, `tracking.py`, etc.), improving testability and discoverability.
 
-**Interaction features: multiplicative only.** No polynomial features, division-based interactions, or interactions involving categoricals. Pearson correlation misses non-linear relationships.
+**Chunked CSV: no true streaming.** `load_data` concatenates all chunks into memory. For datasets larger than available RAM, chunked reading still runs out of memory. True out-of-core training would require Dask or a fundamentally different approach.
 
-**RFECV and OHE expansion.** RFECV's support mask operates on the post-OHE feature space. A categorical column can only be eliminated if all its dummies are eliminated together, which rarely happens in practice.
+**Interaction features: multiplicative pairwise only.** No polynomial features, division-based features, or interactions involving categoricals. Pearson correlation is used to select pairs, which misses non-linear relationships (Spearman or mutual information would be more robust).
 
-**Calibration on small val sets.** If the val set is small (< 500 samples), isotonic calibration will have high variance and may worsen probability estimates. Consider `cv=5` instead of `cv="prefit"` for small datasets.
+**RFECV and OHE expansion.** RFECV's support mask operates on the post-OHE feature space. In practice, RFECV can only eliminate an original categorical column if *all* of its one-hot dummies are eliminated together, which is unlikely.
 
-**Threshold tuning on val set.** If val is not representative of production (e.g. temporal shift), the tuned threshold may be suboptimal. For time-sensitive applications, val should be a chronologically later window.
+**Calibration on a small val set.** If the val set is small (< 500 samples), calibration will have high variance and may worsen probability estimates. For small datasets, consider `cv=5` for calibration instead of `cv="prefit"`.
 
-**Ensemble uses the same `best_n` for all members.** Each Optuna trial's optimal tree count may differ; a more correct ensemble would re-determine `best_n` per member.
+**Threshold tuning on val set.** If the val set is not representative of production data (e.g. temporal shift), the tuned threshold may be suboptimal. For time-sensitive applications, the val set should be a chronologically later window.
 
-**PCA trigger is count-based.** A condition-number-based trigger would be more principled than a raw column count threshold.
+**Ensemble uses same `best_n` for all members.** Each Optuna trial's optimal tree count may differ; a more correct ensemble would re-determine `best_n` per member.
 
-**`scale_pos_weight` is fixed.** Computed once from the global class ratio; does not reflect asymmetric misclassification costs (e.g. false negatives being 10× more costly than false positives).
+**PCA trigger is count-based.** A dataset with 11 numerical features (above the default threshold of 10) uses PCA even if features are uncorrelated. A condition-number-based trigger would be more principled.
 
-**Pandera schema inferred from first run.** If training data has errors, those errors are baked into the schema. Ideal: infer once from a known-good reference batch and version-control it.
+**Great Expectations is a scaffold.** No expectations are configured by default — the GE integration always passes without user customization.
 
-**MLflow failures are silent after startup.** When `mlflow_tracking_uri` is set but tracking calls fail mid-run, they are silently skipped after a debug log. A startup connectivity check would surface problems earlier.
+**`scale_pos_weight` is fixed.** Computed once from the global training set ratio. Does not reflect asymmetric misclassification costs (e.g. false negatives being 10× more costly than false positives). Cost-sensitive weighting requires domain knowledge.
+
+**Pandera schema inferred from first run.** If the training data has errors (e.g. corrupted batch), those errors are baked into the schema. Ideal setup: infer once from a known-good reference batch and version it.
+
+**MLflow has no startup warning.** When `MLFLOW_URI` is set but MLflow initialization fails, tracking is silently skipped. A warning on startup would be safer.
 
 ---
 
-## 14. Development Notes
+## Development Notes
 
-- `train.py` at the project root is the entrypoint; keep it as a thin launcher.
-- New reusable behavior belongs under `xgb_prototype/`.
-- Prefer config-driven behavior over hard-coded dataset assumptions. If a change only applies to one dataset, use a config option or validation rule — don't hard-code it.
-- Keep artifact dict keys backward-compatible: add new keys rather than renaming existing ones.
-- Add tests when changing config keys or defaults, metric selection logic, feature inference rules, threshold policy behavior, artifact structure, serving response shape, or preprocessing logic.
-- Generated directories (`models/`, `plots/`, `.pytest_cache/`, `__pycache__/`) are not source — do not commit them.
-- The package should stay general-purpose. Dataset-specific logic belongs in config or per-project validation rules.
+- Keep `train.py` at the project root as a compatibility wrapper.
+- Put new reusable behavior under `xgb_prototype/`.
+- Prefer config-driven behavior over hard-coded dataset assumptions.
+- Keep artifact keys backward-compatible when possible.
+- Add tests for new config keys, metrics, threshold policies, and serving behavior.
+- Generated directories (`models/`, `plots/`, `.pytest_cache/`, `__pycache__/`) are not source code.
+- The package should stay general-purpose. If a change only applies to one dataset, prefer a config option or validation rule over hard-coding it.
+- Claude Sonnet 4.6 & GPT 5.5 high has assisted in building this project

@@ -5,18 +5,18 @@ import importlib.metadata
 import logging
 
 _HARD = [
-    ("xgboost",      "xgboost",            "1.7.0"),
-    ("scikit-learn", "sklearn",            "1.3.0"),
-    ("numpy",        "numpy",              "1.23.0"),
-    ("pandas",       "pandas",             "1.5.0"),
+    ("xgboost",      "xgboost",  "2.0.0"),
+    ("scikit-learn", "sklearn",  "1.4.0"),
+    ("numpy",        "numpy",    "1.26.0"),
+    ("pandas",       "pandas",   "2.0.0"),
 ]
 _SOFT = [
-    ("optuna",              "optuna",             "3.0.0"),
-    ("plotly",              "plotly",             "5.0.0"),
-    ("omegaconf",           "omegaconf",          "2.3.0"),
-    ("scipy",               "scipy",              "1.9.0"),
-    ("joblib",              "joblib",             "1.2.0"),
-    ("great-expectations",  "great_expectations", "0.18.0"),
+    ("optuna",             "optuna",             "4.8.0"),
+    ("plotly",             "plotly",             "6.7.0"),
+    ("omegaconf",          "omegaconf",          "2.3.0"),
+    ("scipy",              "scipy",              "1.9.0"),
+    ("joblib",             "joblib",             "1.3.0"),
+    ("great-expectations", "great_expectations", "1.16.0"),
 ]
 
 
