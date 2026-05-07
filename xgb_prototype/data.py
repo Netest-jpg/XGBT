@@ -585,14 +585,21 @@ def detect_drift(
         te_counts = np.array([(X_test[col]  == c).sum() for c in cats], dtype=float)
         if tr_counts.sum() == 0 or te_counts.sum() == 0:
             continue
-        expected = tr_counts / tr_counts.sum() * te_counts.sum()
-        mask = expected > 0
+        # Restrict to categories present in both splits.
+        # Categories in test but not train (new vocabulary) are logged separately
+        # and excluded — feeding them into chi-square distorts the null distribution.
+        mask = (tr_counts > 0) & (te_counts > 0)
         if mask.sum() < 2:
             continue
-            # Ensure observed and expected sums match after masking
-        exp_masked = expected[mask]
-        exp_masked = exp_masked * (te_counts[mask].sum() / exp_masked.sum())
-        _, pval = scipy_stats.chisquare(te_counts[mask], f_exp=exp_masked)
+        new_in_test = [cats[i] for i, v in enumerate(tr_counts)
+                       if v == 0 and te_counts[i] > 0]
+        if new_in_test:
+            log.warning("  '%s': %d unseen-in-train category(s) excluded from χ² test: %s",
+                        col, len(new_in_test), new_in_test[:5])
+        tr_masked = tr_counts[mask]
+        te_masked = te_counts[mask]
+        expected  = tr_masked / tr_masked.sum() * te_masked.sum()
+        _, pval = scipy_stats.chisquare(te_masked, f_exp=expected)
         report.pvalues_categorical[col] = float(pval)
         if pval < DRIFT_ALPHA:
             report.drifted_categorical.append(col)
