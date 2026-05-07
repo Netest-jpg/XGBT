@@ -18,7 +18,7 @@ from sklearn.metrics import (
 )
 from sklearn.pipeline import Pipeline
 
-from .settings import MODEL_OUTPUT_DIR, THRESHOLD_POLICY
+from .settings import MODEL_OUTPUT_DIR, THRESHOLD_POLICY, PLOTS_ENABLED
 from .metrics import MetricConfig
 from .plots import plot_confusion_matrix, plot_pr_curve, plot_residuals, plot_roc_curve
 
@@ -74,9 +74,11 @@ def evaluate(
             log.info("  ROC-AUC : %.4f", auc)
             results["auprc"]   = auprc
             results["roc_auc"] = auc
-            plot_pr_curve(y_test_eval, y_proba, threshold)
-            plot_roc_curve(y_test_eval, y_proba)
-        plot_confusion_matrix(y_test_eval, y_pred)
+            if PLOTS_ENABLED:
+                plot_pr_curve(y_test_eval, y_proba, threshold)
+                plot_roc_curve(y_test_eval, y_proba)
+        if PLOTS_ENABLED:
+            plot_confusion_matrix(y_test_eval, y_pred)
     else:
         rmse = np.sqrt(mean_squared_error(y_test_eval, y_pred))
         mae  = mean_absolute_error(y_test_eval, y_pred)
@@ -85,7 +87,8 @@ def evaluate(
         results["rmse"] = rmse
         results["mae"]  = mae
         results["r2"]   = r2
-        plot_residuals(y_test_eval, y_pred)
+        if PLOTS_ENABLED:
+            plot_residuals(y_test_eval, y_pred)
 
     return results
 

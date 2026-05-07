@@ -28,7 +28,7 @@ import logging
 log = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.WARNING,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    format='%(asctime)s [ %(levelname)s ]\t%(message)s',
     force=True  # This is the "sledgehammer" that overrides other configs
 )
 logging.getLogger("great_expectations").setLevel(logging.WARNING)
@@ -124,9 +124,103 @@ check_deps()
 # ─────────────────────────────────────────────
 
 def main() -> None:
-    log.info("=" * 60)
-    log.info(" XGBoost v7 · Optuna+CV · Calibration · SHAP · Plotly · Versioned")
-    log.info("=" * 60)
+    # ── Dynamic startup banner ───────────────────────────────────────────────
+    def _banner() -> None:
+        import sys, os
+        try:
+            _term_w = os.get_terminal_size().columns
+        except OSError:
+            _term_w = 62          # fallback for piped output / no tty
+        W = max(40, min(60, _term_w - 2))
+
+        def _top():     return "╔" + "═" * W + "╗"
+        def _bot():     return "╚" + "═" * W + "╝"
+        def _div():     return "╠" + "═" * W + "╣"
+        def _row(t=""): return "║ " + t[:W - 2].ljust(W - 2) + " ║"
+
+        def _section(label: str, items: list) -> list:
+            out = [_div(), _row(f"  {label}")]
+            for item in items:
+                out.append(_row(f"      · {item}"))
+            return out
+
+        lines: list = []
+        lines.append("")
+        lines.append(_top())
+        lines.append(_row())
+        title = "XGBoost Training Pipeline"
+        pad = (W - 2 - len(title) - 1) // 2
+        lines.append(_row(" " * pad + title))
+        lines.append(_row())
+
+        # ── Search ────────────────────────────────────────────────────────
+        cv_label  = f"CV {CV_FOLDS}-fold ({CV_STRATEGY})" if CV_FOLDS > 0 else "fast-path subsample"
+        n_est_lbl = (f"n_estimators tuned [{N_ESTIMATORS_MIN}–{N_ESTIMATORS_MAX}]"
+                     if TUNE_N_ESTIMATORS else f"early-stop @ {N_ESTIMATORS_MAX}")
+        lines += _section("Search", [
+            f"{N_TRIALS} trials",
+            cv_label,
+            "wide search" if WIDE_SEARCH else "standard search",
+            n_est_lbl,
+            f"metric: {METRIC_NAME}",
+        ])
+
+        # ── Options ───────────────────────────────────────────────────────
+        core: list = []
+        if CALIBRATION_ENABLED:   core.append("calibration")
+        if FEATURE_SELECTION:     core.append("RFECV feature selection")
+        if PANDERA_VALIDATION:    core.append("Pandera validation")
+        if USE_GPU:               core.append("GPU acceleration")
+        if TARGET_LOG_TRANSFORM:  core.append("log-transform target")
+        if core:
+            lines += _section("Options", core)
+
+        # ── Baselines ─────────────────────────────────────────────────────
+        if BASELINES_ENABLED:
+            bl: list = []
+            if BASELINE_INCLUDE_DUMMY:  bl.append("dummy")
+            if BASELINE_INCLUDE_LINEAR: bl.append("logistic regression")
+            if BASELINE_INCLUDE_XGB:    bl.append("default XGBoost")
+            if bl:
+                lines += _section("Baselines", bl)
+
+        # ── Ensemble ──────────────────────────────────────────────────────
+        if ENSEMBLE_ENABLED:
+            lines += _section("Ensemble", [f"top-{ENSEMBLE_TOP_K} soft-vote"])
+
+        # ── Diagnostics ───────────────────────────────────────────────────
+        if PLOTS_ENABLED:
+            diag: list = []
+            if OPTUNA_PLOTS_ENABLED:    diag.append("Optuna plots")
+            if LEARNING_CURVE_ENABLED:  diag.append("learning curve")
+            if PERM_IMPORTANCE_ENABLED: diag.append("permutation importance")
+            if THRESHOLD_SWEEP_ENABLED: diag.append("threshold sweep")
+            if OUTLIER_REPORT_ENABLED:  diag.append("outlier report")
+            if PDP_ENABLED:             diag.append(f"partial dependence (top {PDP_TOP_N})")
+            if PCA_PLOTS_ENABLED:       diag.append("PCA plots")
+            if diag:
+                lines += _section("Diagnostics", diag)
+
+        # ── Drift Monitor ─────────────────────────────────────────────────
+        if DRIFT_MONITOR_ENABLED:
+            lines += _section("Drift Monitor", [
+                f"persistence = {DRIFT_MONITOR_PERSISTENCE} consecutive checks",
+                f"retrain severity = {DRIFT_MONITOR_RETRAIN_SEVERITY}",
+            ])
+
+        # ── MLflow ────────────────────────────────────────────────────────
+        if MLFLOW_URI:
+            lines += _section("MLflow", [
+                f"experiment: {MLFLOW_EXPERIMENT}",
+                f"uri: {MLFLOW_URI}",
+            ])
+
+        lines.append(_bot())
+        lines.append("")
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+
+    _banner()
 
     run_id    = uuid.uuid4().hex[:8]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -139,11 +233,13 @@ def main() -> None:
 
         # ── 1-3. Load, clean, validate ───────────────────────────────────────
         df = load_data()
+        log.info("[0/9] Config validated — target='%s', task='%s'", TARGET_COL, TASK)
         check_config(df)
         df = clean_data(df)
         df = apply_pretransforms(df)
         validate_data(df)
         validate_pandera(df, TARGET_COL)
+        log.info("")
 
         X = df.drop(columns=[TARGET_COL])
         y = df[TARGET_COL]
@@ -156,7 +252,24 @@ def main() -> None:
             le = LabelEncoder()
             y  = pd.Series(le.fit_transform(y), name=TARGET_COL)
 
-        # ── 4. Feature detection ─────────────────────────────────────────────
+        # ── 3. Split ─────────────────────────────────────────────────────────
+        log.info("[metric] Inspecting target distribution...")
+        metric = select_metric(y, TASK)
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE,
+            stratify=y if TASK == "classification" else None,
+        )
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train, y_train, test_size=0.15, random_state=RANDOM_STATE,
+            stratify=y_train if TASK == "classification" else None,
+        )
+        log.info("[3/9] Split — train: %d, val: %d, test: %d",
+                 len(X_train), len(X_val), len(X_test))
+        log.info("")
+
+        # ── 3b. PCA check ────────────────────────────────────────────────────
+        # Feature types needed to evaluate PCA threshold
         num_cols, ohe_cat_cols, te_cat_cols = detect_feature_types(X)
 
         use_pca = len(num_cols) > PCA_THRESHOLD
@@ -168,25 +281,13 @@ def main() -> None:
         else:
             log.info("[3b/9] PCA skipped (num_cols=%d ≤ threshold=%d)",
                      len(num_cols), PCA_THRESHOLD)
+        log.info("")
 
-        log.info("[metric] Inspecting target distribution...")
-        metric = select_metric(y, TASK)
-
-        # ── Three-way split ──────────────────────────────────────────────────
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE,
-            stratify=y if TASK == "classification" else None,
-        )
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_train, y_train, test_size=0.15, random_state=RANDOM_STATE,
-            stratify=y_train if TASK == "classification" else None,
-        )
-        log.info("  Split — train: %d, val: %d, test: %d",
-                 len(X_train), len(X_val), len(X_test))
-
-        # ── Drift, variance filter, interactions, RFECV ──────────────────────
+        # ── 3c. Drift detection ──────────────────────────────────────────────
         drift_report = detect_drift(X_train, X_test, num_cols, ohe_cat_cols + te_cat_cols)
+        log.info("")
 
+        # ── 4. Feature engineering ───────────────────────────────────────────
         num_cols, ohe_cat_cols, te_cat_cols = filter_low_variance(
             X_train, num_cols, ohe_cat_cols, te_cat_cols
         )
@@ -200,6 +301,7 @@ def main() -> None:
             num_cols, ohe_cat_cols, te_cat_cols = select_features_rfecv(
                 X_train, y_train, num_cols, ohe_cat_cols, te_cat_cols, TASK, metric
             )
+        log.info("")
 
         feature_schema = {
             "num_cols":     num_cols,
@@ -223,12 +325,13 @@ def main() -> None:
         )
         if baseline_path is not None:
             log.info("  Baseline comparison saved → %s", baseline_path)
-
+        log.info("")
         # ── 5. Optuna tuning ─────────────────────────────────────────────────
         best_params, study = tune_hyperparameters(
             X_train, y_train, X_val, y_val,
             num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, use_pca,
         )
+        log.info("")
 
         if PLOTS_ENABLED and OPTUNA_PLOTS_ENABLED:
             plot_optuna_diagnostics(study)
@@ -255,7 +358,6 @@ def main() -> None:
 
         if TUNE_N_ESTIMATORS:
             best_n = int(final_params.pop("n_estimators", N_ESTIMATORS_MAX))
-            log.info("  tune_n_estimators=true → using Optuna best n_estimators=%d", best_n)
             refit_pipeline = build_pipeline(
                 num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, final_params,
                 n_estimators=best_n, early_stop=0, use_pca=use_pca,
@@ -304,6 +406,16 @@ def main() -> None:
             _refit_model.set_params(callbacks=[_refit_cb])
             _refit_model.fit(X_tv_proc, y_trainval, verbose=False)
             cb_history = _refit_cb.history
+        final_pipeline = refit_pipeline
+
+        # ── 6b. Threshold tuning ─────────────────────────────────────────────
+        log.info("[6b/9] Tuning decision threshold on val set...")
+        best_threshold = tune_threshold(
+            final_pipeline, X_val, y_val, metric, X_val_proc=X_val_proc
+        )
+        log.info("")
+
+        # ── 6c. Calibration ──────────────────────────────────────────────────
         if TASK == "classification" and CALIBRATION_ENABLED:
             log.info("[6c/9] Calibrating classifier (CalibratedClassifierCV prefit)...")
             raw_xgb = refit_pipeline.named_steps["model"]
@@ -321,15 +433,9 @@ def main() -> None:
 
             calibrated.fit(X_val_proc, np.array(y_val))
             refit_pipeline.steps[-1] = ("model", calibrated)
+            final_pipeline = refit_pipeline
             log.info("  Calibration done.")
-
-        final_pipeline = refit_pipeline
-
-        # ── 6b. Threshold tuning ─────────────────────────────────────────────
-        log.info("[6b/9] Tuning decision threshold on val set...")
-        best_threshold = tune_threshold(
-            final_pipeline, X_val, y_val, metric, X_val_proc=X_val_proc
-        )
+            log.info("")
 
         # ── 7. Evaluate ──────────────────────────────────────────────────────
         eval_metrics = evaluate(
@@ -337,7 +443,7 @@ def main() -> None:
             threshold=best_threshold, X_test_proc=X_test_proc,
             log_transformed=log_transformed,
         )
-
+        log.info("")
         # ── Ensemble ─────────────────────────────────────────────────────────
         ensemble_path: Path | None = None
         ensemble_summary: dict = {
@@ -366,6 +472,8 @@ def main() -> None:
                     ensemble_path,
                 )
                 log.info("  Top-K ensemble saved → %s", ensemble_path)
+        else:
+            log.info("[ensemble] [skipped]")
 
         # ── N5: error analysis ────────────────────────────────────────────────
         error_csv = analyse_errors(
@@ -378,27 +486,41 @@ def main() -> None:
             plot_feature_importance(
                 final_pipeline, num_cols, ohe_cat_cols, te_cat_cols, use_pca
             )
-        if PLOTS_ENABLED and PERM_IMPORTANCE_ENABLED:
-            plot_permutation_importance(
-                final_pipeline, X_test, y_test,
-                num_cols, ohe_cat_cols, te_cat_cols,
-                metric, TASK, X_test_proc=X_test_proc,
-            )
-        if PLOTS_ENABLED and THRESHOLD_SWEEP_ENABLED:
-            plot_threshold_sweep(
-                final_pipeline, X_val, y_val, metric, X_val_proc=X_val_proc
-            )
-        if PLOTS_ENABLED and OUTLIER_REPORT_ENABLED:
-            plot_outlier_report(
-                final_pipeline, X_train, X_test, y_test, num_cols, use_pca
-            )
-        if PLOTS_ENABLED and PDP_ENABLED:
-            plot_partial_dependence(
-                final_pipeline, X_train, y_train,
-                num_cols, ohe_cat_cols, te_cat_cols, use_pca, TASK,
-            )
-        if PLOTS_ENABLED and PCA_PLOTS_ENABLED and use_pca:
-            plot_pca_diagnostics(final_pipeline, X_train, y_train, TASK)
+            if PERM_IMPORTANCE_ENABLED:
+                plot_permutation_importance(
+                    final_pipeline, X_test, y_test,
+                    num_cols, ohe_cat_cols, te_cat_cols,
+                    metric, TASK, X_test_proc=X_test_proc,
+                )
+            else:
+                log.info("[perm_importance] [skipped]")
+            if THRESHOLD_SWEEP_ENABLED:
+                plot_threshold_sweep(
+                    final_pipeline, X_val, y_val, metric, X_val_proc=X_val_proc
+                )
+            else:
+                log.info("[threshold_sweep] [skipped]")
+            if OUTLIER_REPORT_ENABLED:
+                plot_outlier_report(
+                    final_pipeline, X_train, X_test, y_test, num_cols, use_pca
+                )
+            else:
+                log.info("[outlier_report] [skipped]")
+            if PDP_ENABLED:
+                plot_partial_dependence(
+                    final_pipeline, X_train, y_train,
+                    num_cols, ohe_cat_cols, te_cat_cols, use_pca, TASK,
+                )
+            else:
+                log.info("[partial_dependence] [skipped]")
+            if PCA_PLOTS_ENABLED and use_pca:
+                plot_pca_diagnostics(final_pipeline, X_train, y_train, TASK)
+            elif PCA_PLOTS_ENABLED and not use_pca:
+                log.info("[pca_plots] [skipped] — PCA not active")
+            else:
+                log.info("[pca_plots] [skipped]")
+        else:
+            log.info("[8/9] Plots [skipped]")
 
         # ── Drift monitor reference ───────────────────────────────────────────
         known_categories: dict[str, set] = {
@@ -423,6 +545,8 @@ def main() -> None:
                 "  Drift monitor reference captured → %d monitored feature(s)",
                 drift_monitor.feature_count,
             )
+        else:
+            log.info("[drift_monitor] [skipped]")
 
         # ── 9. Save artifact ─────────────────────────────────────────────────
         config_snapshot = dict(

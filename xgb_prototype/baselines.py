@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,8 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from xgboost import XGBClassifier, XGBRegressor
 
 from .thresholds import tune_binary_threshold
+
+log = logging.getLogger(__name__)
 
 
 def _classification_metrics(y_true, y_pred, y_proba=None) -> dict[str, float]:
@@ -113,6 +116,7 @@ def evaluate_baselines(
 ) -> tuple[list[dict[str, Any]], Path | None]:
     """Fit cheap baselines and save a CSV comparison table."""
     if not enabled:
+        log.info("[baseline] [skipped]")
         return [], None
 
     cat_cols = ohe_cat_cols + te_cat_cols
@@ -202,4 +206,3 @@ def evaluate_baselines(
     path = output_dir / f"baseline_comparison_{run_id}.csv"
     pd.DataFrame(rows).to_csv(path, index=False)
     return rows, path
-

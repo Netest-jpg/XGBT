@@ -81,7 +81,7 @@ target_log_transform: false # true → log1p(y) for regression (requires y > 0)
 
 # ── Runtime acceleration / validation ─────────
 use_gpu: false              # true → use CUDA when available, otherwise CPU fallback
-pandera_validation: true    # true → infer and run Pandera schema checks
+pandera_validation: false    # true → infer and run Pandera schema checks
 callback_log_period: 50     # log XGBoost progress every N boosting rounds
 variance_threshold: 0.0     # drop numerical columns at/below this variance before RFECV
 interaction_top_k: 10       # max correlated numerical feature pairs to expand
@@ -100,7 +100,7 @@ threshold_policy:
 
 # ── Baseline comparison ───────────────────────
 baselines:
-  enabled: true
+  enabled: false
   include_dummy: true       # DummyClassifier / DummyRegressor
   include_linear: true      # LogisticRegression for classification
   include_default_xgb: true # non-tuned XGBoost reference model
@@ -123,7 +123,7 @@ diagnostics:
 
 # ── Continuous drift monitoring ───────────────
 drift_monitor:
-  enabled: true
+  enabled: false
   persistence: 3            # alert only after drift persists for N consecutive checks
   min_feature_drift_ratio: 0.10
   retrain_feature_ratio: 0.25

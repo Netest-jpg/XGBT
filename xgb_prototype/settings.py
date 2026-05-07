@@ -53,7 +53,7 @@ if _log_file:
 
 logging.basicConfig(
     level=_log_level,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [ %(levelname)s ]\t%(message)s",
     datefmt="%H:%M:%S",
     handlers=_handlers,
     force=True,

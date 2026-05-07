@@ -303,7 +303,7 @@ def tune_hyperparameters(
         # No budget, no timeout — fall back to bare N_TRIALS, no wall-clock guard
         effective_timeout = None
         effective_n_trials = N_TRIALS
-        log.info("  Budget: n_trials=%d, no timeout", effective_n_trials)
+        log.info("  Budget: n_trials=%d, timeout=none", effective_n_trials)
 
     # ── Objective ─────────────────────────────────────────────────────────────
     def objective(trial: optuna.Trial) -> float:
@@ -398,10 +398,15 @@ def tune_hyperparameters(
     study   = optuna.create_study(direction=metric.direction, sampler=sampler, pruner=pruner)
     _timeout_label = f"{effective_timeout}s" if effective_timeout is not None else "none"
     _nest_label    = f"tuned({N_ESTIMATORS_MIN}–{N_ESTIMATORS_MAX})" if TUNE_N_ESTIMATORS else f"fixed@{N_ESTIMATORS_MAX}+earlystop"
-    log.info("[5/9] Optuna search (%d trials · %s timeout · %d subsample rows · "
-             "metric=%s · cv=%s · wide=%s · n_estimators=%s · parallel_folds=%s)...",
-             effective_n_trials, _timeout_label, n_sub,
-             metric.name, n_folds if use_cv else "off", WIDE_SEARCH, _nest_label,
+    log.info("[5/9] Optuna search [ Trials : %d | Timeout : %s | Subsample rows : %d | "
+             "Metric : %s | CV : %s | Wide : %s | n_estimators : %s | Parallel folds : %s ]...",
+             effective_n_trials,
+             f"{effective_timeout}s" if effective_timeout is not None else "none",
+             n_sub,
+             metric.name,
+             n_folds if use_cv else "off",
+             WIDE_SEARCH,
+             _nest_label,
              "yes" if use_cv else "n/a")
     with tqdm(total=effective_n_trials, ncols=100, desc="Optuna search") as pbar:
         def _objective_with_progress(trial):
@@ -453,6 +458,7 @@ def build_top_k_ensemble(
     selected = complete_trials[:top_k]
 
     if len(selected) < 2:
+        log.info("[ensemble] [skipped] — fewer than 2 completed Optuna trials")
         return None, {
             "enabled": True, "status": "skipped",
             "reason": "fewer than 2 completed Optuna trials",
