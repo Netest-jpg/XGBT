@@ -589,7 +589,10 @@ def detect_drift(
         mask = expected > 0
         if mask.sum() < 2:
             continue
-        _, pval = scipy_stats.chisquare(te_counts[mask], f_exp=expected[mask])
+            # Ensure observed and expected sums match after masking
+        exp_masked = expected[mask]
+        exp_masked = exp_masked * (te_counts[mask].sum() / exp_masked.sum())
+        _, pval = scipy_stats.chisquare(te_counts[mask], f_exp=exp_masked)
         report.pvalues_categorical[col] = float(pval)
         if pval < DRIFT_ALPHA:
             report.drifted_categorical.append(col)
