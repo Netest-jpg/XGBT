@@ -1,137 +1,235 @@
-# ── Task ──────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  XGB PROTOTYPE  ·  Training Configuration
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ─────────────────────────────────────────────
+#  TASK
+# ─────────────────────────────────────────────
 task: classification        # "classification" | "regression"
 target_col: Class
 test_size: 0.2
 random_state: 42
 
-# ── Paths ─────────────────────────────────────
-model_output_dir: models    # timestamped artifacts saved here
+
+# ─────────────────────────────────────────────
+#  PATHS
+# ─────────────────────────────────────────────
+data_path: creditcard.csv   # .csv · .parquet · .json · .jsonl · .xlsx
+                            # glob patterns also supported: "data/batch_*.csv"
+model_output_dir: models    # timestamped model artifacts saved here
 plot_output_dir: plots      # HTML + PNG plots saved here
 
-# ── Data loading (UPGRADE 15) ─────────────────
-# Supports .csv, .parquet, .json, .jsonl, .xlsx
-# Also supports glob patterns: "data/batch_*.csv"
-data_path: creditcard.csv
-csv_chunk_size: null        # null = normal read; int = stream CSV in row chunks with progress logs
-csv_chunk_log_every: 10     # log every N CSV chunks when chunked loading is enabled
 
-# ── Logging ───────────────────────────────────
+# ─────────────────────────────────────────────
+#  DATA LOADING
+# ─────────────────────────────────────────────
+csv_chunk_size: null        # null = load all at once
+                            # int  = stream CSV in row-chunks (useful for large files)
+csv_chunk_log_every: 10     # log progress every N chunks when chunked loading is active
+
+
+# ─────────────────────────────────────────────
+#  LOGGING
+# ─────────────────────────────────────────────
 log_level: INFO             # DEBUG | INFO | WARNING | ERROR
-log_file: null              # null = stdout only; or "train.log"
+log_file: null              # null = stdout only; path = write to file e.g. "train.log"
 
-# ── Cross-validation ──────────────────────────
-# CV vs fast-path:
+
+# ─────────────────────────────────────────────
+#  CROSS-VALIDATION
+# ─────────────────────────────────────────────
 #   cv_folds > 0  → always use CV with that many folds
 #   cv_folds = 0  → always use fast-path subsample
-#   cv_folds = -1 → auto: CV when n_rows < 50k, fast-path otherwise  (recommended)
+#   cv_folds = -1 → auto: CV when n_rows < 50k, fast-path otherwise (recommended)
 cv_folds: 5
 cv_strategy: stratified     # "stratified" | "timeseries"
 
-# ── Optuna ────────────────────────────────────
+
+# ─────────────────────────────────────────────
+#  OPTUNA HYPERPARAMETER SEARCH
+# ─────────────────────────────────────────────
 n_trials: 30
-optuna_budget_seconds: null
-optuna_timeout: null
-# ── Search subsample ──────────────────────────────────────────────────────────
-# Fraction of training rows used per trial (fast-path only).
-# Hard-capped at 50k rows in code regardless of this value.
-search_subsample: 0.6
+optuna_budget_seconds: null # wall-clock budget cap (overrides n_trials when set)
+optuna_timeout: null        # per-trial timeout in seconds
+
+# Fast-path subsampling (used when cv_folds = 0 or auto fast-path is triggered)
+search_subsample: 0.6       # fraction of training rows per trial; hard-capped at 50k rows
+
+# n_estimators search strategy — choose one:
+#   tune_n_estimators: true  → Optuna searches n_estimators directly (no early stopping in trials)
+#   tune_n_estimators: false → early stopping drives n_estimators (original behaviour)
+tune_n_estimators: true
+n_estimators_min: 100
 n_estimators_max: 500
-n_estimators_min: 100        # lower bound when tune_n_estimators: true
-tune_n_estimators: true      # true → Optuna searches n_estimators (no early stopping in trials)
-                             # false → early stopping drives n_estimators (original behaviour)
-early_stop_rnds: 20
-robust_scaler_cols: ["Amount", "Time"]   # these cols get RobustScaler; all others get PowerTransformer
+early_stop_rnds: 20         # rounds without improvement before early stopping triggers
 
-# ── PCA ───────────────────────────────────────
-pca_threshold: 999
-pca_variance: 0.95
-pca_max_components: null
+# Broader search space (more trials recommended alongside this)
+wide_search: false          # true → broader hyperparameter ranges
 
-# ── Imbalance ─────────────────────────────────
-imbalance_threshold: 0.15
 
-# ── Feature inference ─────────────────────────
-cardinality_limit: 20       # int cols with ≤ N unique vals → categorical
+# ─────────────────────────────────────────────
+#  PREPROCESSING
+# ─────────────────────────────────────────────
+robust_scaler_cols: ["Amount", "Time"]  # these columns get RobustScaler
+                                        # all other numeric columns get PowerTransformer
+power_transform: true                   # apply PowerTransformer to non-robust-scaled numeric cols
 
-# ── Wide hyperparameter search ────────────────
-wide_search: false          # true → broader ranges + more trials
+# Applied before any scaling or feature engineering
+pretransform_log1p_cols: []             # log1p applied to these columns first
+pretransform_drop_cols: []              # columns dropped before any feature work
 
-# ── Drift detection (UPGRADE 12) ──────────────
-drift_alpha: 0.05           # p-value threshold; feature flagged if p < alpha
-drift_warn_only: true       # false → raise ValueError on any drift detected
+# Variance filter — applied before RFECV
+variance_threshold: 0.0     # drop numeric columns at or below this variance
 
-# ── Feature selection (UPGRADE 23) ────────────
-feature_selection: true    # true → RFECV before Optuna; drops low-value features
+# Automatic type inference
+cardinality_limit: 20       # integer columns with ≤ N unique values are treated as categorical
 
-# ── Target encoding (UPGRADE 24) ──────────────
-target_encoding_threshold: 50  # object cols with > N unique vals → TargetEncoder (not OHE)
+# Target encoding (replaces one-hot encoding for high-cardinality object columns)
+target_encoding_threshold: 50  # object columns with > N unique values → TargetEncoder
 
-# ── MLflow experiment tracking (UPGRADE 25) ───
-mlflow_tracking_uri: null   # e.g. "http://localhost:5000"; null = disabled
-mlflow_experiment: xgb_prototype
+# Feature interaction expansion
+interaction_top_k: 10       # max correlated numeric feature pairs to generate cross-features
 
-# ── Outlier detection (UPGRADE 28) ────────────
-outlier_contamination: 0.05 # IsolationForest expected outlier fraction
 
-# ── Partial dependence plots (UPGRADE 29) ─────
-pdp_top_n: 5                # top-N features by XGBoost gain to plot PDP+ICE
+# ─────────────────────────────────────────────
+#  PCA
+# ─────────────────────────────────────────────
+pca_threshold: 999          # apply PCA only when feature count exceeds this value
+pca_variance: 0.95          # retain this fraction of explained variance
+pca_max_components: null    # hard cap on components; null = no cap
 
-# ── Regression log-transform (UPGRADE 30) ─────
-target_log_transform: false # true → log1p(y) for regression (requires y > 0)
 
-# ── Runtime acceleration / validation ─────────
-use_gpu: false              # true → use CUDA when available, otherwise CPU fallback
-pandera_validation: false    # true → infer and run Pandera schema checks
-callback_log_period: 50     # log XGBoost progress every N boosting rounds
-variance_threshold: 0.0     # drop numerical columns at/below this variance before RFECV
-interaction_top_k: 10       # max correlated numerical feature pairs to expand
-calibration_enabled: true   # calibrate classifiers on validation predictions
+# ─────────────────────────────────────────────
+#  CLASS IMBALANCE
+# ─────────────────────────────────────────────
+imbalance_threshold: 0.15   # minority class ratio below this triggers imbalance handling
 
-# ── Objective selection ───────────────────────
-metric: accuracy                # auto | roc_auc | auprc | macro_f1 | weighted_f1 | r2
 
-# ── Threshold policy (binary classification) ──
+# ─────────────────────────────────────────────
+#  FEATURE SELECTION
+# ─────────────────────────────────────────────
+feature_selection: true     # run RFECV before Optuna to drop low-value features
+
+
+# ─────────────────────────────────────────────
+#  OUTLIER DETECTION
+# ─────────────────────────────────────────────
+outlier_contamination: 0.05 # IsolationForest expected outlier fraction (0–0.5)
+
+
+# ─────────────────────────────────────────────
+#  OBJECTIVE & METRIC
+# ─────────────────────────────────────────────
+# "auto" selects the metric based on task type and class balance.
+#
+# Classification metrics:
+#   roc_auc · auprc · accuracy · balanced_accuracy
+#   f1_macro · f1_weighted · precision_macro · recall_macro
+#   log_loss · brier_score · ece · hamming_loss
+#
+# Regression metrics:
+#   r2 · rmse · mae · mse · median_absolute_error
+metric: auto
+
+
+# ─────────────────────────────────────────────
+#  THRESHOLD POLICY  (binary classification only)
+# ─────────────────────────────────────────────
+#   auto                  → picks the mode best suited to the chosen metric
+#   f1                    → maximise F1 score
+#   fbeta                 → maximise F-beta (set beta below)
+#   precision_at_recall   → highest precision subject to min_recall
+#   recall_at_precision   → highest recall subject to min_precision
+#   disabled              → use default 0.5 threshold
 threshold_policy:
-  mode: auto                # auto | f1 | fbeta | precision_at_recall | recall_at_precision | disabled
-  beta: 1.0                 # used when mode=fbeta
-  min_precision: 0.80       # used when mode=recall_at_precision
-  min_recall: 0.80          # used when mode=precision_at_recall
-  n_quantiles: 200          # candidate thresholds from probability quantiles
+  mode: auto
+  beta: 1.0               # F-beta weight; >1 favours recall, <1 favours precision
+  min_precision: 0.80     # floor for mode=recall_at_precision
+  min_recall: 0.80        # floor for mode=precision_at_recall
+  n_quantiles: 200        # candidate threshold points sampled from predicted probabilities
 
-# ── Baseline comparison ───────────────────────
+
+# ─────────────────────────────────────────────
+#  CALIBRATION
+# ─────────────────────────────────────────────
+calibration_enabled: true   # post-hoc probability calibration on validation predictions
+
+
+# ─────────────────────────────────────────────
+#  BASELINE COMPARISON
+# ─────────────────────────────────────────────
 baselines:
   enabled: false
-  include_dummy: true       # DummyClassifier / DummyRegressor
-  include_linear: true      # LogisticRegression for classification
-  include_default_xgb: true # non-tuned XGBoost reference model
+  include_dummy: true         # DummyClassifier / DummyRegressor
+  include_linear: true        # LogisticRegression (classification) or Ridge (regression)
+  include_default_xgb: true   # non-tuned XGBoost reference model
 
-# ── Top-K Optuna ensemble ─────────────────────
+
+# ─────────────────────────────────────────────
+#  ENSEMBLE  (top-K Optuna trials)
+# ─────────────────────────────────────────────
 ensemble:
-  enabled: false            # true → fit/store a soft-voting ensemble from top Optuna trials
-  top_k: 3                  # number of completed Optuna trials to ensemble
+  enabled: false    # fit a soft-voting ensemble from the top-K completed Optuna trials
+  top_k: 3
 
-# ── Diagnostics / plots ───────────────────────
-diagnostics:
-  plots_enabled: false
-  optuna_plots: true
-  learning_curve: true
-  permutation_importance: true
-  threshold_sweep: true
-  outlier_report: true
-  partial_dependence: true
-  pca_plots: true
 
-# ── Continuous drift monitoring ───────────────
+# ─────────────────────────────────────────────
+#  DRIFT DETECTION
+# ─────────────────────────────────────────────
+drift_alpha: 0.05           # p-value threshold; feature flagged if p < alpha
+drift_warn_only: true       # false → raise ValueError on drift (blocks training)
+
+
+# ─────────────────────────────────────────────
+#  CONTINUOUS DRIFT MONITORING
+# ─────────────────────────────────────────────
 drift_monitor:
   enabled: false
-  persistence: 3            # alert only after drift persists for N consecutive checks
-  min_feature_drift_ratio: 0.10
-  retrain_feature_ratio: 0.25
-  retrain_severity: high    # none | low | medium | high
-  
-#Optional PowerTransform
-power_transform: true
+  persistence: 3                  # only alert after drift persists for N consecutive checks
+  min_feature_drift_ratio: 0.10   # minimum fraction of drifted features to trigger alert
+  retrain_feature_ratio: 0.25     # fraction of drifted features that triggers auto-retrain
+  retrain_severity: high          # none | low | medium | high
 
-# ── Pre-transform hooks ───────────────────────────────────────
-pretransform_log1p_cols: []   # log1p applied before PowerTransformer
-pretransform_drop_cols: []      # dropped before any feature work
+
+# ─────────────────────────────────────────────
+#  DIAGNOSTICS & PLOTS
+# ─────────────────────────────────────────────
+callback_log_period: 50     # log XGBoost boosting progress every N rounds
+
+diagnostics:
+  plots_enabled: false          # master switch; set true to enable all plots below
+  optuna_plots: true            # hyperparameter importance + optimisation history
+  learning_curve: true          # train vs. validation score vs. training size
+  permutation_importance: true  # model-agnostic feature importance
+  threshold_sweep: true         # precision/recall/F1 vs. decision threshold
+  partial_dependence: true      # PDP + ICE for top-N features
+  pca_plots: true               # explained variance and component projections
+  outlier_report: true          # IsolationForest anomaly score distribution
+
+pdp_top_n: 5                # number of top features (by XGBoost gain) to include in PDP+ICE
+
+
+# ─────────────────────────────────────────────
+#  VALIDATION
+# ─────────────────────────────────────────────
+pandera_validation: false   # infer and run Pandera schema checks on input data
+
+
+# ─────────────────────────────────────────────
+#  RUNTIME
+# ─────────────────────────────────────────────
+use_gpu: false              # true → prefer CUDA; falls back to CPU if unavailable
+
+
+# ─────────────────────────────────────────────
+#  MLFLOW EXPERIMENT TRACKING
+# ─────────────────────────────────────────────
+mlflow_tracking_uri: null   # e.g. "http://localhost:5000"; null = MLflow disabled
+mlflow_experiment: xgb_prototype
+
+
+# ─────────────────────────────────────────────
+#  REGRESSION EXTRAS
+# ─────────────────────────────────────────────
+target_log_transform: false # true → apply log1p(y) before training (requires y > 0)

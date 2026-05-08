@@ -29,13 +29,44 @@ Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if you don
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Then clone and install:
+Git clone and install:
 
 ```bash
 git clone https://github.com/Netest-jpg/XGBT.git
 cd XGBT
 uv sync --group dev
 ```
+
+Activate the virtual environment:
+```bash
+source .venv/bin/activate
+```
+
+Then load your training dataset:
+
+Recommended layout:
+```text
+my_project/
+├── data/
+│   └── my_new_dataset.csv
+├── config.yaml
+└── xgb_prototype/
+```
+
+Edit the three required config values in `config.yaml`:
+```yaml
+task: classification        # or regression
+target_col: your_target       # the column you want to predict
+data_path: data/my_new_dataset.csv        # path to your csv
+```
+
+Run the program:
+```bash
+uv run python train.py
+```
+
+Finally, adjust the configs according to your dataset.
+
 ---
 
 ## 1. Project Overview
@@ -121,41 +152,9 @@ RUN_XGB_PROTOTYPE_SMOKE=1 uv run python -m pytest tests/test_smoke_training.py -
 
 ---
 
-## 4. To use this template With a new CSV
+## 4. Short Training Guide
 
-### Step 0 — Prepare your CSV
-
-Your CSV should have one row per training example, one target column, any number of feature columns, and a header row with column names.
-
-```csv
-age,income,plan_type,tenure_months,churned
-34,72000,pro,18,0
-52,105000,business,44,1
-```
-
-### Step 1 — Put the CSV somewhere predictable
-
-Recommended layout:
-
-```text
-my_project/
-├── data/
-│   └── my_new_dataset.csv
-├── config.yaml
-└── xgb_prototype/
-```
-
-### Step 2 — Edit the three required config values in `config.yaml`
-
-```yaml
-task: classification        # or regression
-target_col: your_target       # the column you want to predict
-data_path: data/my_new_dataset.csv        # path to your csv
-```
-
-### Step 3 — Run a fast draft first
-
-Confirm the dataset loads and the pipeline trains before tuning:
+### For a quick draft run:
 
 ```yaml
 cv_folds: 0
@@ -169,7 +168,7 @@ diagnostics:
 uv run python train.py
 ```
 
-### Step 4 — Move to a better run
+### For a better run:
 
 ```yaml
 cv_folds: 5
@@ -185,26 +184,32 @@ Classification targets: binary flags (`0/1`), yes/no, multi-class labels like `l
 
 Regression targets: continuous numeric values like `price`, `revenue`, `delivery_time_minutes`.
 
-### After training, check
+### After training, check:
 
 ```text
-models/baseline_comparison_<run_id>.csv   # Is tuned XGBoost beating simpler models?
-models/error_analysis_<run_id>.csv        # What high-confidence mistakes did it make?
-plots/                                    # Feature importance, PR curve, threshold sweep, etc.
+models/baseline_comparison_<run_id>.csv
+# Is tuned XGBoost beating simpler models?
+
+models/error_analysis_<run_id>.csv
+# What high-confidence mistakes did it make?
+
+plots/
+# Feature importance, PR curve, threshold sweep, etc.
 ```
 
-If the tuned model barely beats the dummy baseline: check data leakage, target quality, feature usefulness, or whether the task is learnable from available columns. If logistic regression beats XGBoost: the relationship may be mostly linear, or the search needs more trials.
+If the tuned model barely beats the dummy baseline : check for data leakage, target quality, feature usefulness, or whether the task is learnable from available columns.
+If logistic regression beats XGBoost: the relationship may be mostly linear, or the search needs more trials.
 
 ### Common problems
 
 | Problem | Fix |
 |---------|-----|
-| Target column not found | Check `target_col` capitalization |
+| Target column not found | Check `target_col`'s spelling & capitalization|
 | Data path matched no files | Use an absolute path; verify glob pattern |
 | Too slow | Set `cv_folds: 0`, lower `n_trials`, disable diagnostics |
 | Memory issues | Disable PCA plots and permutation importance, lower `target_encoding_threshold` |
 | Bad classification threshold | Try `threshold_policy.mode: f1` or `fbeta` |
-| Regression target skew | Try `target_log_transform: true` if target is positive |
+| Regression target skew | Try `target_log_transform: true` if target > 0 |
 
 ### Large dataset tips
 
@@ -258,7 +263,7 @@ csv_chunk_size: null          # null = read normally; integer = stream in chunks
 csv_chunk_log_every: 10
 ```
 
-Supported `data_path` formats: `.csv`, `.parquet`, `.json`, `.jsonl`, `.xlsx`, `.xls`, glob patterns like `data/monthly_*.csv`.
+Supported `data_path` formats: `.csv`, `.parquet`, `.json`, `.jsonl`, `.xlsx`, `.xls` and glob patterns like `data/monthly_*.csv`.
 
 `csv_chunk_size` improves CSV ingestion progress logging for large files but does not enable true out-of-core training — the dataframe is still materialized before training begins.
 
@@ -282,7 +287,9 @@ log_file: null              # null = console only; path = console + file
 cv_folds: 5                 # 0 = faster validation-split path
 cv_strategy: stratified     # stratified | timeseries
 ```
-`cv_folds`: Number of folds used during Optuna tuning. Use `cv_folds: 0` for a quick first run on a large dataset. Use `cv_folds: 5` for a reliable search.
+`cv_folds`: Number of folds used during Optuna tuning.
+Use `cv_folds: 0` for a quick first run on a large dataset.
+Use `cv_folds: 5` for a reliable search.
 
 ### Optuna search settings
 
@@ -300,20 +307,6 @@ early_stop_rnds: 20       # stop after this many rounds without validation impro
 wide_search: false          # true = expanded search ranges
 ```
 
-Fast draft run:
-```yaml
-n_trials: 5
-cv_folds: 0
-n_estimators_max: 100
-```
-
-More serious run:
-```yaml
-n_trials: 50
-cv_folds: 5
-n_estimators_max: 500
-```
-
 ### PCA settings
 
 ```yaml
@@ -327,23 +320,35 @@ To effectively disable PCA unless there are many numerical features:
 pca_threshold: 1000
 ```
 
-### Imbalance and metric settings
+### Metric
 
 ```yaml
 imbalance_threshold: 0.15   # minority class ratio below this → use AUPRC
 metric: auto
 ```
 
-Supported `metric` values:
+| Value | When to use |
+|---|---|
+| `auto` | Recommended — auto-selects based on task and class balance |
+| `roc_auc` | Binary classification, balanced classes |
+| `auprc` | Binary classification, imbalanced classes |
+| `accuracy` | When all prediction errors cost the same |
+| `balanced_accuracy` | Imbalanced classes, equal per-class weight |
+| `f1_macro` | Multi-class, all classes matter equally |
+| `f1_weighted` | Multi-class with class imbalance |
+| `precision_macro` / `recall_macro` | When precision or recall matters specifically |
+| `log_loss` / `brier_score` / `ece` | Probability calibration quality |
+| `hamming_loss` | Multi-label or when exact-match errors are counted |
+| `r2` | Regression — explained variance |
+| `rmse` / `mae` / `mse` | Regression — raw error magnitude |
+| `median_absolute_error` | Regression — robust to outliers |
 
-| Value | Use when |
-|-------|----------|
-| `auto` | Default — code chooses sensible metric |
-| `roc_auc` | Balanced binary classification |
-| `auprc` | Very imbalanced binary classification |
-| `macro_f1` | Multiclass where all classes matter equally |
-| `weighted_f1` | Multiclass with class imbalance |
-| `r2` | Regression |
+Auto-selection rules:
+- **Binary, balanced** (minority ≥ 15%): `roc_auc`
+- **Binary, imbalanced** (minority < 15%): `auprc`
+- **Multi-class, balanced**: `f1_macro`
+- **Multi-class, skewed**: `f1_weighted`
+- **Regression**: `r2
 
 ### Feature inference settings
 
