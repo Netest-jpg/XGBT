@@ -7,14 +7,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
-    average_precision_score,
     classification_report,
     confusion_matrix,
     f1_score,
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
-    roc_auc_score,
 )
 from sklearn.pipeline import Pipeline
 
@@ -35,58 +30,73 @@ def evaluate(
     X_test_proc: np.ndarray | None = None,
     log_transformed: bool = False,
 ) -> dict:
-    """Score on held-out test set. Applies expm1() when log_transformed=True."""
+    """Score on held-out test set with the full extended metric suite."""
+    from .metrics import compute_classification_metrics, compute_regression_metrics
+
     log.info("[7/9] Evaluation on held-out test set")
-    results: dict = {}
     model_step = pipeline.named_steps["model"] if X_test_proc is not None else None
 
     def _proba(X):
         if model_step is not None:
-            return model_step.predict_proba(X_test_proc)[:, 1]
-        return pipeline.predict_proba(X)[:, 1]
+            return model_step.predict_proba(X_test_proc)
+        return pipeline.predict_proba(X)
 
-    def _predict(X):
+    def _predict_raw(X):
         if model_step is not None:
             raw = model_step.predict(X_test_proc)
             return np.expm1(raw) if log_transformed else raw
         if task == "classification" and metric.needs_proba:
-            return (pipeline.predict_proba(X)[:, 1] >= threshold).astype(int)
+            return (_proba(X)[:, 1] >= threshold).astype(int)
         raw = pipeline.predict(X)
         return np.expm1(raw) if log_transformed else raw
 
-    if task == "classification" and metric.needs_proba:
-        y_proba = _proba(X_test)
-        y_pred  = (y_proba >= threshold).astype(int)
-        log.info("  Using threshold = %.4f", threshold)
-    else:
-        y_pred  = _predict(X_test)
-        y_proba = None
-
     y_test_eval = np.expm1(np.array(y_test)) if log_transformed else np.array(y_test)
+    is_binary   = len(np.unique(y_test_eval)) == 2
 
     if task == "classification":
+        y_proba_2d = _proba(X_test)                       # shape (n, n_classes)
+        y_proba_1d = y_proba_2d[:, 1] if is_binary else None
+        y_pred     = (y_proba_2d[:, 1] >= threshold).astype(int) if is_binary \
+                     else np.argmax(y_proba_2d, axis=1)
+        log.info("  Using threshold = %.4f", threshold)
+
+        results = compute_classification_metrics(
+            y_test_eval, y_pred,
+            y_proba_2d if not is_binary else y_proba_1d,
+            is_binary=is_binary,
+        )
+
         log.info("\n%s", classification_report(y_test_eval, y_pred))
         log.info("Confusion Matrix:\n%s", confusion_matrix(y_test_eval, y_pred))
-        if metric.needs_proba and y_proba is not None:
-            auprc = average_precision_score(y_test_eval, y_proba)
-            auc   = roc_auc_score(y_test_eval, y_proba)
-            log.info("  AUPRC   : %.4f", auprc)
-            log.info("  ROC-AUC : %.4f", auc)
-            results["auprc"]   = auprc
-            results["roc_auc"] = auc
-            if PLOTS_ENABLED:
-                plot_pr_curve(y_test_eval, y_proba, threshold)
-                plot_roc_curve(y_test_eval, y_proba)
+
+        # Log the full suite in a tidy table
+        _CLF_ORDER = [
+            "accuracy", "balanced_accuracy",
+            "roc_auc", "auprc",
+            "precision_micro", "precision_macro", "precision_weighted",
+            "recall_micro",    "recall_macro",    "recall_weighted",
+            "f1_micro",        "f1_macro",        "f1_weighted",
+            "specificity", "hamming_loss",
+            "log_loss", "brier_score", "ece",
+        ]
+        for k in _CLF_ORDER:
+            if k in results:
+                log.info("  %-26s: %.4f", k, results[k])
+
+        if PLOTS_ENABLED and y_proba_1d is not None:
+            plot_pr_curve(y_test_eval, y_proba_1d, threshold)
+            plot_roc_curve(y_test_eval, y_proba_1d)
         if PLOTS_ENABLED:
             plot_confusion_matrix(y_test_eval, y_pred)
+
     else:
-        rmse = np.sqrt(mean_squared_error(y_test_eval, y_pred))
-        mae  = mean_absolute_error(y_test_eval, y_pred)
-        r2   = r2_score(y_test_eval, y_pred)
-        log.info("  RMSE : %.4f  MAE : %.4f  R² : %.4f", rmse, mae, r2)
-        results["rmse"] = rmse
-        results["mae"]  = mae
-        results["r2"]   = r2
+        y_pred  = _predict_raw(X_test)
+        results = compute_regression_metrics(y_test_eval, y_pred)
+        log.info(
+            "  R²=%.4f  RMSE=%.4f  MAE=%.4f  MSE=%.4f  MedianAE=%.4f",
+            results["r2"], results["rmse"], results["mae"],
+            results["mse"], results["median_absolute_error"],
+        )
         if PLOTS_ENABLED:
             plot_residuals(y_test_eval, y_pred)
 

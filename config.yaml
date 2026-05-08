@@ -88,7 +88,7 @@ interaction_top_k: 10       # max correlated numerical feature pairs to expand
 calibration_enabled: true   # calibrate classifiers on validation predictions
 
 # ── Objective selection ───────────────────────
-metric: auto                # auto | roc_auc | auprc | macro_f1 | weighted_f1 | r2
+metric: accuracy                # auto | roc_auc | auprc | macro_f1 | weighted_f1 | r2
 
 # ── Threshold policy (binary classification) ──
 threshold_policy:
