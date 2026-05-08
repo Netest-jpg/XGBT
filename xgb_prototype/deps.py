@@ -17,6 +17,9 @@ _SOFT = [
     ("scipy",              "scipy",              "1.9.0"),
     ("joblib",             "joblib",             "1.3.0"),
     ("great-expectations", "great_expectations", "1.16.0"),
+    ("SALib",              "SALib",              "1.5.0"),
+    ("featuretools",       "featuretools",       "1.31.0"),
+    ("tsfresh",            "tsfresh",            "0.21.0"),
 ]
 
 

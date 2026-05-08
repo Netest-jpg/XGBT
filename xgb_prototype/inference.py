@@ -44,6 +44,7 @@ class PredictWrapper:
         self.cat_cols        = self.ohe_cat_cols + self.te_cat_cols
         self._known_categories: dict[str, set] = artifact.get("known_categories", {})
         self._log_transformed: bool = artifact.get("log_transformed", False)
+        self._drift_monitor = artifact.get("drift_monitor")
 
     def _warn_unseen(self, X: "pd.DataFrame") -> None:
         for col in self.cat_cols:
@@ -78,6 +79,26 @@ class PredictWrapper:
         prob = self.pipeline.predict_proba(X)[:, 1]
         raw  = (prob >= t).astype(int)
         return self.le.inverse_transform(raw) if self.le is not None else raw
+
+    def check_drift(
+        self,
+        X: "pd.DataFrame",
+        y: np.ndarray | None = None,
+        segment_cols: list[str] | None = None,
+    ) -> dict:
+        """Run the persisted drift monitor against an inference batch."""
+        if self._drift_monitor is None:
+            return {"checked": False, "reason": "artifact has no drift_monitor"}
+        self._warn_unseen(X)
+        predictions = self.pipeline.predict(X)
+        proba = self.pipeline.predict_proba(X) if hasattr(self.pipeline, "predict_proba") else None
+        return self._drift_monitor.check(
+            X,
+            y_new=y,
+            predictions=predictions,
+            prediction_proba=proba,
+            segment_cols=segment_cols,
+        ).to_dict()
 
 
 # ─────────────────────────────────────────────
@@ -163,6 +184,7 @@ class ModelServer:
         self._metric       = artifact.get("metric")
         self._eval_metrics = artifact.get("eval_metrics", {})
         self._log_tf       = artifact.get("log_transformed", False)
+        self._drift_monitor = artifact.get("drift_monitor")
 
         # Expected feature columns (original, pre-preprocessor)
         num_cols     = artifact.get("num_cols", [])
@@ -252,6 +274,20 @@ class ModelServer:
             "eval_metrics":    self._eval_metrics,
             "log_transformed": self._log_tf,
         }
+
+    def check_drift(
+        self,
+        data: "pd.DataFrame | dict",
+        y: list | np.ndarray | None = None,
+        segment_cols: list[str] | None = None,
+    ) -> dict:
+        """Validate input and return production drift/skew diagnostics."""
+        if self._drift_monitor is None:
+            return {"checked": False, "reason": "artifact has no drift_monitor"}
+        df, warnings = self._prepare(data)
+        result = self._wrapper.check_drift(df, y=np.asarray(y) if y is not None else None, segment_cols=segment_cols)
+        result["warnings"] = warnings
+        return result
 
     # ── Private helpers ───────────────────────────────────────────────────────
 

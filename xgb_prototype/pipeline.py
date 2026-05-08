@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import importlib.metadata
 import logging
+from functools import lru_cache
 from typing import Any
 from tqdm import tqdm
 import joblib
@@ -18,6 +19,7 @@ from sklearn.metrics import average_precision_score, mean_absolute_error, mean_s
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, PowerTransformer, RobustScaler, TargetEncoder
+import xgboost as xgb
 from xgboost import XGBClassifier, XGBRegressor
 from xgboost import callback as xgb_callback
 
@@ -28,11 +30,21 @@ from .settings import (
     PCA_MAX_COMPONENTS, PCA_VARIANCE,
     RANDOM_STATE, SEARCH_SUBSAMPLE, USE_GPU, WIDE_SEARCH, ENSEMBLE_ENABLED, ENSEMBLE_TOP_K,
     POWER_TRANSFORM, ROBUST_SCALER_COLS,
+    SEARCH_BACKEND, NATIVE_XGB_CV_ROUNDS, NATIVE_XGB_CV_EARLY_STOP,
+    SOBOL_ENABLED, SOBOL_N_BASE_SAMPLES, SOBOL_MAX_EVALS,
 )
 from .metrics import MetricConfig
 
 log = logging.getLogger(__name__)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+
+def _as_xgb_matrix(X) -> np.ndarray:
+    """Return a compact numeric matrix for repeated XGBoost trial scoring."""
+    if hasattr(X, "toarray"):
+        return X.astype(np.float32)
+    arr = np.asarray(X)
+    return arr.astype(np.float32, copy=False) if np.issubdtype(arr.dtype, np.floating) else arr
 
 
 # ── N1: XGBoost iteration logging callback ────────────────────────────────────
@@ -121,6 +133,11 @@ def _resolve_tree_method() -> tuple[str, str | None]:
     return "gpu_hist", None
 
 
+@lru_cache(maxsize=1)
+def _cached_tree_method() -> tuple[str, str | None]:
+    return _resolve_tree_method()
+
+
 # ── Pipeline builder ──────────────────────────────────────────────────────────
 
 def build_pipeline(
@@ -143,7 +160,7 @@ def build_pipeline(
                     impute + optional PowerTransformer. Already PCA-normalised.
     """
     params      = params or {}
-    tree_method, device = _resolve_tree_method()
+    tree_method, device = _cached_tree_method()
 
     # ── Split numerical cols into robust-scaled vs power-transformed ──────────
     robust_in_num = [c for c in ROBUST_SCALER_COLS if c in num_cols]
@@ -204,6 +221,265 @@ def build_pipeline(
 
 # ── Optuna hyperparameter tuning ──────────────────────────────────────────────
 
+def _xgb_model_params(
+    task: str,
+    metric: MetricConfig,
+    params: dict[str, Any],
+    n_classes: int | None = None,
+) -> dict[str, Any]:
+    if task == "classification" and n_classes and n_classes > 2:
+        objective = "multi:softprob"
+    elif task == "classification":
+        objective = "binary:logistic"
+    else:
+        objective = "reg:squarederror"
+    tree_method, device = _cached_tree_method()
+    shared = dict(
+        objective=objective,
+        eval_metric=metric.eval_metric,
+        max_depth=int(params.get("max_depth", 6)),
+        learning_rate=float(params.get("learning_rate", 0.1)),
+        subsample=float(params.get("subsample", 0.8)),
+        colsample_bytree=float(params.get("colsample_bytree", 0.8)),
+        min_child_weight=float(params.get("min_child_weight", 1)),
+        reg_alpha=float(params.get("reg_alpha", 0.0)),
+        reg_lambda=float(params.get("reg_lambda", 1.0)),
+        nthread=int(params.get("nthread", -1)),
+        seed=RANDOM_STATE,
+        tree_method=tree_method,
+        verbosity=0,
+    )
+    if device is not None:
+        shared["device"] = device
+    if metric.scale_pos_weight is not None:
+        shared["scale_pos_weight"] = metric.scale_pos_weight
+    if task == "classification" and n_classes and n_classes > 2:
+        shared["num_class"] = int(n_classes)
+    return shared
+
+
+def _score_booster(
+    booster: xgb.Booster,
+    dmat: xgb.DMatrix,
+    y_true: np.ndarray,
+    task: str,
+    metric: MetricConfig,
+) -> float:
+    raw = booster.predict(dmat)
+    if task == "classification":
+        if raw.ndim == 2:
+            y_pred = np.argmax(raw, axis=1)
+            y_proba = raw if metric.needs_proba else None
+        else:
+            y_proba = raw if metric.needs_proba else None
+            y_pred = (raw >= 0.5).astype(int)
+    else:
+        y_pred = raw
+        y_proba = None
+    return float(metric.score(y_true, y_pred, y_proba))
+
+
+def _train_xgb_score(
+    X_train_proc,
+    y_train_arr: np.ndarray,
+    X_val_proc,
+    y_val_arr: np.ndarray,
+    task: str,
+    metric: MetricConfig,
+    params: dict[str, Any],
+    n_estimators: int,
+    early_stopping_rounds: int | None = None,
+) -> tuple[float, int]:
+    n_classes = len(np.unique(y_train_arr)) if task == "classification" else None
+    xgb_params = _xgb_model_params(task, metric, params, n_classes=n_classes)
+    dtrain = xgb.DMatrix(X_train_proc, label=y_train_arr)
+    dval = xgb.DMatrix(X_val_proc, label=y_val_arr)
+    fit_kwargs: dict[str, Any] = {"verbose_eval": False}
+    evals = [(dval, "validation")]
+    if early_stopping_rounds is not None and early_stopping_rounds > 0:
+        fit_kwargs["early_stopping_rounds"] = int(early_stopping_rounds)
+    booster = xgb.train(
+        xgb_params,
+        dtrain,
+        num_boost_round=max(1, int(n_estimators)),
+        evals=evals,
+        **fit_kwargs,
+    )
+    best_iteration = int(getattr(booster, "best_iteration", n_estimators - 1) or 0)
+    return _score_booster(booster, dval, y_val_arr, task, metric), best_iteration
+
+
+def _score_candidate(
+    X_train_proc,
+    y_train_arr: np.ndarray,
+    X_val_proc,
+    y_val_arr: np.ndarray,
+    task: str,
+    metric: MetricConfig,
+    params: dict[str, Any],
+    n_estimators: int,
+) -> float:
+    score, _ = _train_xgb_score(
+        X_train_proc, y_train_arr, X_val_proc, y_val_arr,
+        task, metric, params, n_estimators,
+    )
+    return score
+
+
+def _run_sobol_sensitivity(
+    X_train_proc,
+    y_train_arr: np.ndarray,
+    X_val_proc,
+    y_val_arr: np.ndarray,
+    task: str,
+    metric: MetricConfig,
+    n_sub: int,
+) -> dict[str, Any]:
+    if not SOBOL_ENABLED:
+        return {"enabled": False}
+    try:
+        from SALib.analyze import sobol as sobol_analyze
+        from SALib.sample import sobol as sobol_sample
+    except ImportError:
+        log.warning("[Sobol] SALib not installed — sensitivity analysis skipped.")
+        return {"enabled": True, "status": "skipped", "reason": "SALib not installed"}
+
+    problem = {
+        "num_vars": 3,
+        "names": ["max_depth", "learning_rate", "subsample"],
+        "bounds": [[3, 10], [0.01, 0.30], [0.50, 1.00]],
+    }
+    try:
+        samples = sobol_sample.sample(problem, SOBOL_N_BASE_SAMPLES, calc_second_order=False)
+    except Exception:
+        from SALib.sample import saltelli
+        samples = saltelli.sample(problem, SOBOL_N_BASE_SAMPLES, calc_second_order=False)
+    if len(samples) > SOBOL_MAX_EVALS:
+        samples = samples[:SOBOL_MAX_EVALS]
+
+    rng = np.random.default_rng(RANDOM_STATE)
+    n_rows = len(X_train_proc)
+    n_eval = min(max(100, n_sub), n_rows)
+    idx = rng.choice(n_rows, size=n_eval, replace=False) if n_eval < n_rows else np.arange(n_rows)
+
+    scores = []
+    log.info("[Sobol] Analysing max_depth, learning_rate, subsample (%d evaluations)...", len(samples))
+    for raw_depth, lr, subsample in samples:
+        params = {
+            "max_depth": int(round(raw_depth)),
+            "learning_rate": float(lr),
+            "subsample": float(subsample),
+            "colsample_bytree": 0.8,
+            "min_child_weight": 1,
+            "reg_alpha": 0.0,
+            "reg_lambda": 1.0,
+        }
+        try:
+            score = _score_candidate(
+                X_train_proc[idx], y_train_arr[idx],
+                X_val_proc, y_val_arr,
+                task, metric, params,
+                n_estimators=min(150, N_ESTIMATORS_MAX),
+            )
+            scores.append(score)
+        except Exception as exc:
+            log.debug("[Sobol] candidate failed: %s", exc)
+            scores.append(np.nan)
+
+    y = np.asarray(scores, dtype=float)
+    finite = np.isfinite(y)
+    if finite.sum() < 8:
+        return {"enabled": True, "status": "skipped", "reason": "too few successful evaluations"}
+    samples_used = samples[finite]
+    y_used = y[finite]
+    try:
+        si = sobol_analyze.analyze(problem, y_used, calc_second_order=False, print_to_console=False)
+        rows = []
+        for name, s1, st, s1_conf, st_conf in zip(
+            problem["names"], si["S1"], si["ST"], si["S1_conf"], si["ST_conf"]
+        ):
+            rows.append({
+                "parameter": name,
+                "first_order": float(s1),
+                "total_order": float(st),
+                "first_order_conf": float(s1_conf),
+                "total_order_conf": float(st_conf),
+            })
+        rows.sort(key=lambda r: abs(r["total_order"]), reverse=True)
+        log.info("[Sobol] Parameter impact ranking: %s", rows)
+        return {
+            "enabled": True,
+            "status": "completed",
+            "metric": metric.name,
+            "direction": metric.direction,
+            "evaluations": int(finite.sum()),
+            "parameters": rows,
+        }
+    except Exception as exc:
+        # SALib requires the full Sobol design for exact indices. If users cap
+        # evaluations too aggressively, keep a useful correlation fallback.
+        corr_rows = []
+        for i, name in enumerate(problem["names"]):
+            corr = np.corrcoef(samples_used[:, i], y_used)[0, 1]
+            corr_rows.append({"parameter": name, "score_correlation": float(corr) if np.isfinite(corr) else 0.0})
+        corr_rows.sort(key=lambda r: abs(r["score_correlation"]), reverse=True)
+        log.warning("[Sobol] Exact analysis unavailable (%s); using correlation fallback.", exc)
+        return {
+            "enabled": True,
+            "status": "fallback",
+            "metric": metric.name,
+            "evaluations": int(finite.sum()),
+            "parameters": corr_rows,
+        }
+
+
+def _native_xgb_cv_search(
+    X_train_proc,
+    y_train_arr: np.ndarray,
+    task: str,
+    metric: MetricConfig,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    params = {
+        "max_depth": 6,
+        "learning_rate": 0.1,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "min_child_weight": 1,
+        "reg_alpha": 0.0,
+        "reg_lambda": 1.0,
+    }
+    dtrain = xgb.DMatrix(X_train_proc, label=y_train_arr)
+    n_classes = len(np.unique(y_train_arr)) if task == "classification" else None
+    xgb_params = _xgb_model_params(task, metric, params, n_classes=n_classes)
+    stratified = bool(task == "classification")
+    folds = CV_FOLDS if CV_FOLDS > 1 else 5
+    log.info(
+        "[5/9] Native xgboost.cv search [ rounds=%d | folds=%d | metric=%s ]...",
+        NATIVE_XGB_CV_ROUNDS, folds, metric.eval_metric,
+    )
+    cv = xgb.cv(
+        params=xgb_params,
+        dtrain=dtrain,
+        num_boost_round=max(1, NATIVE_XGB_CV_ROUNDS),
+        nfold=folds,
+        stratified=stratified,
+        seed=RANDOM_STATE,
+        early_stopping_rounds=max(1, NATIVE_XGB_CV_EARLY_STOP),
+        verbose_eval=False,
+    )
+    best_n = int(len(cv))
+    metric_cols = [c for c in cv.columns if c.endswith("-mean")]
+    best_score = float(cv[metric_cols[-1]].iloc[-1]) if metric_cols else float("nan")
+    params["n_estimators"] = best_n
+    summary = {
+        "backend": "native_xgb_cv",
+        "best_n_estimators": best_n,
+        "best_cv_score": best_score,
+        "cv_columns": list(cv.columns),
+    }
+    log.info("  Native xgboost.cv best_n_estimators=%d score=%.6f", best_n, best_score)
+    return params, summary
+
 def tune_hyperparameters(
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -215,8 +491,8 @@ def tune_hyperparameters(
     task: str,
     metric: MetricConfig,
     use_pca: bool,
-) -> tuple[dict, optuna.Study]:
-    """FIX 2 + U1/U8/U17: Optuna TPE search. Returns (best_params, study)."""
+) -> tuple[dict, optuna.Study | None, dict[str, Any]]:
+    """Tune hyperparameters. Returns (best_params, optuna_study_or_none, search_summary)."""
     import time
 
     # ── Pre-fit preprocessor once ─────────────────────────────────────────────
@@ -224,8 +500,8 @@ def tune_hyperparameters(
     _prep_pipe = build_pipeline(num_cols, ohe_cat_cols, te_cat_cols, task, metric, use_pca=use_pca)
     preprocessor = _prep_pipe.named_steps["preprocessor"]
     with joblib.parallel_backend("loky", n_jobs=-1):
-        X_train_proc = preprocessor.fit_transform(X_train, y_train)
-        X_val_proc   = preprocessor.transform(X_val)
+        X_train_proc = _as_xgb_matrix(preprocessor.fit_transform(X_train, y_train))
+        X_val_proc   = _as_xgb_matrix(preprocessor.transform(X_val))
     y_train_arr = np.array(y_train)
     y_val_arr   = np.array(y_val)
 
@@ -262,6 +538,24 @@ def tune_hyperparameters(
     log.info("  Search subsample: %d / %d rows (%.1f%%)",
              n_sub, n_rows, 100 * n_sub / n_rows)
 
+    search_summary: dict[str, Any] = {
+        "backend": SEARCH_BACKEND,
+        "sobol_sensitivity": _run_sobol_sensitivity(
+            X_train_proc, y_train_arr, X_val_proc, y_val_arr,
+            task, metric, n_sub,
+        ),
+    }
+
+    if SEARCH_BACKEND in ("native_xgb_cv", "xgb_cv", "xgboost_cv"):
+        best_params, native_summary = _native_xgb_cv_search(
+            X_train_proc, y_train_arr, task, metric
+        )
+        search_summary.update(native_summary)
+        return best_params, None, search_summary
+    if SEARCH_BACKEND != "optuna":
+        log.warning("  Unknown search.backend='%s'; falling back to Optuna.", SEARCH_BACKEND)
+        search_summary["backend"] = "optuna"
+
     # ── Budget-driven n_trials / timeout ──────────────────────────────────────
     # Priority: explicit N_TRIALS / OPTUNA_TIMEOUT beat the budget knob.
     # Budget knob (OPTUNA_BUDGET_SECONDS) is the "easy" path for new users.
@@ -270,16 +564,24 @@ def tune_hyperparameters(
     def _run_canary() -> float:
         """Time one trial to calibrate n_trials from the budget."""
         t0 = time.perf_counter()
-        _mdl = XGBClassifier if task == "classification" else XGBRegressor
         _n   = min(n_sub, 5_000)          # tiny slice — just need a timing signal
         _idx = np.random.default_rng(0).integers(0, n_rows, size=_n)
-        _m   = _mdl(
-            n_estimators=50, max_depth=4, learning_rate=0.1,
-            early_stopping_rounds=10, random_state=RANDOM_STATE,
-            eval_metric=metric.eval_metric, nthread=-1, tree_method="hist",
+        _train_xgb_score(
+            X_train_proc[_idx], y_train_arr[_idx],
+            X_val_proc, y_val_arr,
+            task, metric,
+            {
+                "max_depth": 4,
+                "learning_rate": 0.1,
+                "subsample": 0.8,
+                "colsample_bytree": 0.8,
+                "min_child_weight": 1,
+                "reg_alpha": 0.0,
+                "reg_lambda": 1.0,
+            },
+            n_estimators=50,
+            early_stopping_rounds=10,
         )
-        _m.fit(X_train_proc[_idx], y_train_arr[_idx],
-               eval_set=[(X_val_proc, y_val_arr)], verbose=False)
         elapsed = time.perf_counter() - t0
         return max(elapsed, 0.1)     # floor to avoid division by zero
 
@@ -336,17 +638,6 @@ def tune_hyperparameters(
             trial_n_estimators = N_ESTIMATORS_MAX
             trial_early_stop   = EARLY_STOP_RNDS
 
-        shared = dict(
-            n_estimators          = trial_n_estimators,
-            early_stopping_rounds = trial_early_stop,
-            random_state          = RANDOM_STATE,
-            eval_metric           = metric.eval_metric,
-            nthread               = -1,
-            **params,
-        )
-        if metric.scale_pos_weight is not None:
-            shared["scale_pos_weight"] = metric.scale_pos_weight
-
         if use_cv:
             # ── Parallel CV folds ─────────────────────────────────────────────
             # Run all folds concurrently with loky backend.
@@ -354,16 +645,13 @@ def tune_hyperparameters(
             def _fit_fold(tr_idx, vl_idx):
                 X_tr_f, X_vl_f = X_train_proc[tr_idx], X_train_proc[vl_idx]
                 y_tr_f, y_vl_f = y_train_arr[tr_idx],  y_train_arr[vl_idx]
-                mdl = XGBClassifier(**{**shared, "nthread": 1}) if task == "classification" \
-                      else XGBRegressor(**{**shared, "nthread": 1})
-                fit_kwargs: dict = {"verbose": False}
-                if trial_early_stop is not None:
-                    fit_kwargs["eval_set"] = [(X_vl_f, y_vl_f)]
-                mdl.fit(X_tr_f, y_tr_f, **fit_kwargs)
-                y_pred  = mdl.predict(X_vl_f)
-                y_proba = mdl.predict_proba(X_vl_f)[:, 1] \
-                          if metric.needs_proba and task == "classification" else None
-                return metric.score(y_vl_f, y_pred, y_proba)
+                score, _ = _train_xgb_score(
+                    X_tr_f, y_tr_f, X_vl_f, y_vl_f,
+                    task, metric, {**params, "nthread": 1},
+                    n_estimators=trial_n_estimators,
+                    early_stopping_rounds=trial_early_stop,
+                )
+                return score
 
             splits = list(cv_splitter.split(X_train_proc, y_train_arr))
             fold_scores = joblib.Parallel(n_jobs=-1, backend="loky")(
@@ -382,12 +670,14 @@ def tune_hyperparameters(
             idx, _ = next(sss.split(X_train_proc, y_train_arr))
         else:
             idx = np.random.RandomState(trial.number).choice(n_rows, size=n_sub, replace=False)
-        mdl = XGBClassifier(**shared) if task == "classification" else XGBRegressor(**shared)
-        mdl.fit(X_train_proc[idx], y_train_arr[idx], eval_set=[(X_val_proc, y_val_arr)], verbose=False)
-        y_pred  = mdl.predict(X_val_proc)
-        y_proba = mdl.predict_proba(X_val_proc)[:, 1] if metric.needs_proba and task == "classification" else None
-        score   = metric.score(y_val_arr, y_pred, y_proba)
-        trial.report(score, step=mdl.best_iteration)
+        score, best_iteration = _train_xgb_score(
+            X_train_proc[idx], y_train_arr[idx],
+            X_val_proc, y_val_arr,
+            task, metric, params,
+            n_estimators=trial_n_estimators,
+            early_stopping_rounds=trial_early_stop,
+        )
+        trial.report(score, step=best_iteration)
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
         return score
@@ -395,7 +685,7 @@ def tune_hyperparameters(
     # ── Run study ─────────────────────────────────────────────────────────────
     pruner  = optuna.pruners.MedianPruner(n_warmup_steps=10)
     sampler = optuna.samplers.TPESampler(seed=RANDOM_STATE, n_startup_trials=10)
-    study   = optuna.create_study(direction=metric.direction, sampler=sampler, pruner=pruner)
+    study   = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
     _timeout_label = f"{effective_timeout}s" if effective_timeout is not None else "none"
     _nest_label    = f"tuned({N_ESTIMATORS_MIN}–{N_ESTIMATORS_MAX})" if TUNE_N_ESTIMATORS else f"fixed@{N_ESTIMATORS_MAX}+earlystop"
     log.info("[5/9] Optuna search [ Trials : %d | Timeout : %s | Subsample rows : %d | "
@@ -428,12 +718,18 @@ def tune_hyperparameters(
     complete = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE)
     log.info("  Best %s=%.4f  params=%s  (complete=%d, pruned=%d)",
              metric.name, study.best_value, study.best_params, complete, pruned)
-    return study.best_params, study
+    search_summary.update({
+        "backend": "optuna",
+        "best_value": float(study.best_value),
+        "complete_trials": complete,
+        "pruned_trials": pruned,
+    })
+    return study.best_params, study, search_summary
 
 # ── Top-K ensemble (UPGRADE 11) ───────────────────────────────────────────────
 
 def build_top_k_ensemble(
-    study: optuna.Study,
+    study: optuna.Study | None,
     X_trainval: pd.DataFrame,
     y_trainval: pd.Series,
     X_test: pd.DataFrame,
@@ -450,6 +746,13 @@ def build_top_k_ensemble(
     log_transformed: bool,
 ) -> tuple[Any | None, dict]:
     """Fit a soft-voting ensemble from the top-K completed Optuna trials."""
+    if study is None:
+        log.info("[ensemble] [skipped] — Optuna study unavailable for current search backend")
+        return None, {
+            "enabled": True, "status": "skipped",
+            "reason": "Optuna study unavailable for current search backend",
+            "top_k_requested": top_k, "trials_used": 0,
+        }
     complete_trials = [
         t for t in study.trials
         if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None

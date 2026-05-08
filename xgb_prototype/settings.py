@@ -144,6 +144,30 @@ BASELINE_INCLUDE_XGB    = bool(_c("baselines.include_default_xgb", True))
 ENSEMBLE_ENABLED = bool(_c("ensemble.enabled", False))
 ENSEMBLE_TOP_K   = max(1, int(_c("ensemble.top_k", 3)))
 
+# ── Auto feature engineering ─────────────────────────────────────────────────
+AUTO_FE_ENABLED       = bool(_c("auto_feature_engineering.enabled", False))
+AUTO_FE_ENGINE        = str(_c("auto_feature_engineering.engine", "featuretools")).lower()
+AUTO_FE_MAX_FEATURES  = max(1, int(_c("auto_feature_engineering.max_features", 25)))
+AUTO_FE_MAX_DEPTH     = max(1, int(_c("auto_feature_engineering.max_depth", 1)))
+AUTO_FE_ENTITY_ID_COL = _c("auto_feature_engineering.entity_id_col", None)
+AUTO_FE_TIME_INDEX_COL = _c("auto_feature_engineering.time_index_col", None)
+AUTO_FE_TSFRESH_COLUMN_ID = _c("auto_feature_engineering.tsfresh_column_id", None)
+AUTO_FE_TSFRESH_COLUMN_SORT = _c("auto_feature_engineering.tsfresh_column_sort", None)
+
+# ── Search backend / sensitivity ─────────────────────────────────────────────
+SEARCH_BACKEND = str(_c("search.backend", _c("search_backend", "optuna"))).lower()
+NATIVE_XGB_CV_ROUNDS = int(_c("search.native_xgb_cv_rounds", N_ESTIMATORS_MAX))
+NATIVE_XGB_CV_EARLY_STOP = int(_c("search.native_xgb_cv_early_stop", EARLY_STOP_RNDS))
+SOBOL_ENABLED = bool(_c("sobol_sensitivity.enabled", False))
+SOBOL_N_BASE_SAMPLES = max(2, int(_c("sobol_sensitivity.n_base_samples", 16)))
+SOBOL_MAX_EVALS = max(8, int(_c("sobol_sensitivity.max_evals", 128)))
+
+# ── Uncertainty estimation ───────────────────────────────────────────────────
+UNCERTAINTY_ENABLED = bool(_c("uncertainty.enabled", False))
+UNCERTAINTY_ALPHA = float(_c("uncertainty.alpha", 0.10))
+UNCERTAINTY_QUANTILE_LOW = float(_c("uncertainty.quantile_alpha_low", 0.05))
+UNCERTAINTY_QUANTILE_HIGH = float(_c("uncertainty.quantile_alpha_high", 0.95))
+
 # ── Drift monitor ─────────────────────────────────────────────────────────────
 DRIFT_MONITOR_ENABLED         = bool(_c("drift_monitor.enabled",                True))
 DRIFT_MONITOR_PERSISTENCE     = max(1, int(_c("drift_monitor.persistence",      3)))

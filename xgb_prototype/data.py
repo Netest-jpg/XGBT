@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -38,6 +39,84 @@ from .settings import (
 )
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class MissingValueReport:
+    total_missing: int
+    missing_cells_pct: float
+    rows_with_missing: int
+    rows_with_missing_pct: float
+    columns: list[dict]
+    output_csv: str | None = None
+    output_json: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "total_missing": self.total_missing,
+            "missing_cells_pct": self.missing_cells_pct,
+            "rows_with_missing": self.rows_with_missing,
+            "rows_with_missing_pct": self.rows_with_missing_pct,
+            "columns": self.columns,
+            "output_csv": self.output_csv,
+            "output_json": self.output_json,
+        }
+
+
+def automatic_missing_value_report(
+    df: pd.DataFrame,
+    target_col: str,
+    output_dir: Path | None = None,
+    run_id: str | None = None,
+) -> MissingValueReport:
+    """Create a structured missing-value report and optionally persist it."""
+    total_cells = max(int(df.shape[0] * df.shape[1]), 1)
+    missing_mask = df.isna()
+    missing_by_col = missing_mask.sum().sort_values(ascending=False)
+    rows_with_missing = int(missing_mask.any(axis=1).sum())
+    rows_total = max(len(df), 1)
+
+    column_rows: list[dict] = []
+    for col, missing in missing_by_col.items():
+        missing_i = int(missing)
+        if missing_i == 0:
+            continue
+        column_rows.append({
+            "column": str(col),
+            "missing_count": missing_i,
+            "missing_pct": float(missing_i / rows_total),
+            "is_target": bool(col == target_col),
+            "dtype": str(df[col].dtype),
+        })
+
+    report = MissingValueReport(
+        total_missing=int(missing_by_col.sum()),
+        missing_cells_pct=float(missing_by_col.sum() / total_cells),
+        rows_with_missing=rows_with_missing,
+        rows_with_missing_pct=float(rows_with_missing / rows_total),
+        columns=column_rows,
+    )
+
+    if output_dir is not None and run_id is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = output_dir / f"missing_values_{run_id}.csv"
+        json_path = output_dir / f"missing_values_{run_id}.json"
+        pd.DataFrame(column_rows).to_csv(csv_path, index=False)
+        json_path.write_text(json.dumps(report.to_dict(), indent=2))
+        report.output_csv = str(csv_path)
+        report.output_json = str(json_path)
+
+    if report.total_missing:
+        log.warning(
+            "  [missing] %d missing value(s), %.2f%% of cells; %d/%d row(s) affected.",
+            report.total_missing, 100 * report.missing_cells_pct,
+            report.rows_with_missing, len(df),
+        )
+        if column_rows:
+            log.warning("  [missing] Top columns: %s", column_rows[:5])
+    else:
+        log.info("  [missing] No missing values detected.")
+    return report
 
 
 # ── Load ──────────────────────────────────────────────────────────────────────
@@ -535,20 +614,146 @@ def check_config(df: pd.DataFrame) -> None:
 class DriftReport:
     drifted_numerical:   list[str]        = field(default_factory=list)
     drifted_categorical: list[str]        = field(default_factory=list)
+    label_drift:         dict             = field(default_factory=dict)
+    data_quality_drift:  dict             = field(default_factory=dict)
+    serving_training_skew: dict           = field(default_factory=dict)
+    novel_class_emergence: dict           = field(default_factory=dict)
+    segment_drift:       dict             = field(default_factory=dict)
     pvalues_numerical:   dict[str, float] = field(default_factory=dict)
     pvalues_categorical: dict[str, float] = field(default_factory=dict)
 
     @property
     def any_drift(self) -> bool:
-        return bool(self.drifted_numerical or self.drifted_categorical)
+        return bool(
+            self.drifted_numerical
+            or self.drifted_categorical
+            or self.label_drift.get("drift_detected")
+            or self.data_quality_drift.get("drift_detected")
+            or self.serving_training_skew.get("skew_detected")
+            or self.novel_class_emergence.get("novel_classes")
+            or self.segment_drift.get("drifted_segments")
+        )
 
     def to_dict(self) -> dict:
         return {
             "drifted_numerical":   self.drifted_numerical,
             "drifted_categorical": self.drifted_categorical,
+            "label_drift":         self.label_drift,
+            "data_quality_drift":  self.data_quality_drift,
+            "serving_training_skew": self.serving_training_skew,
+            "novel_class_emergence": self.novel_class_emergence,
+            "segment_drift":       self.segment_drift,
             "pvalues_numerical":   self.pvalues_numerical,
             "pvalues_categorical": self.pvalues_categorical,
         }
+
+
+def _distribution_chisquare(
+    ref: pd.Series,
+    new: pd.Series,
+    alpha: float,
+) -> dict:
+    ref_counts_s = ref.dropna().astype(str).value_counts()
+    new_counts_s = new.dropna().astype(str).value_counts()
+    all_values = sorted(set(ref_counts_s.index) | set(new_counts_s.index))
+    if len(all_values) < 2 or ref_counts_s.sum() == 0 or new_counts_s.sum() == 0:
+        return {"drift_detected": False, "pvalue": None, "reason": "insufficient categories"}
+    ref_counts = ref_counts_s.reindex(all_values, fill_value=0).to_numpy(dtype=float)
+    new_counts = new_counts_s.reindex(all_values, fill_value=0).to_numpy(dtype=float)
+    expected = (ref_counts + 1e-6) / (ref_counts + 1e-6).sum() * new_counts.sum()
+    _, pval = scipy_stats.chisquare(new_counts, f_exp=expected)
+    return {
+        "drift_detected": bool(pval < alpha),
+        "pvalue": float(pval),
+        "reference_distribution": {v: int(c) for v, c in zip(all_values, ref_counts)},
+        "new_distribution": {v: int(c) for v, c in zip(all_values, new_counts)},
+    }
+
+
+def _data_quality_drift(
+    X_ref: pd.DataFrame,
+    X_new: pd.DataFrame,
+    alpha: float,
+) -> dict:
+    ref_missing = X_ref.isna().mean()
+    new_missing = X_new.isna().mean()
+    changed_missing: dict[str, dict] = {}
+    for col in sorted(set(X_ref.columns) & set(X_new.columns)):
+        delta = float(new_missing.get(col, 0.0) - ref_missing.get(col, 0.0))
+        if abs(delta) >= max(0.05, alpha):
+            changed_missing[col] = {
+                "reference_missing_pct": float(ref_missing.get(col, 0.0)),
+                "new_missing_pct": float(new_missing.get(col, 0.0)),
+                "delta": delta,
+            }
+    all_null_new = [str(c) for c in X_new.columns if X_new[c].isna().all()]
+    constant_new = [str(c) for c in X_new.columns if X_new[c].nunique(dropna=True) <= 1]
+    duplicate_delta = float(X_new.duplicated().mean() - X_ref.duplicated().mean())
+    drift_detected = bool(changed_missing or all_null_new or abs(duplicate_delta) >= max(0.05, alpha))
+    return {
+        "drift_detected": drift_detected,
+        "missing_rate_changes": changed_missing,
+        "all_null_columns_new": all_null_new,
+        "constant_columns_new": constant_new,
+        "duplicate_rate_reference": float(X_ref.duplicated().mean()),
+        "duplicate_rate_new": float(X_new.duplicated().mean()),
+        "duplicate_rate_delta": duplicate_delta,
+    }
+
+
+def _serving_training_skew(X_ref: pd.DataFrame, X_new: pd.DataFrame) -> dict:
+    ref_cols = set(X_ref.columns)
+    new_cols = set(X_new.columns)
+    missing_columns = sorted(ref_cols - new_cols)
+    extra_columns = sorted(new_cols - ref_cols)
+    dtype_changes = {
+        str(col): {"reference": str(X_ref[col].dtype), "new": str(X_new[col].dtype)}
+        for col in sorted(ref_cols & new_cols)
+        if str(X_ref[col].dtype) != str(X_new[col].dtype)
+    }
+    return {
+        "skew_detected": bool(missing_columns or extra_columns or dtype_changes),
+        "missing_columns": missing_columns,
+        "extra_columns": extra_columns,
+        "dtype_changes": dtype_changes,
+    }
+
+
+def _segment_drift(
+    X_ref: pd.DataFrame,
+    X_new: pd.DataFrame,
+    num_cols: list[str],
+    segment_cols: list[str],
+    alpha: float,
+) -> dict:
+    drifted_segments: list[dict] = []
+    for seg_col in segment_cols:
+        if seg_col not in X_ref.columns or seg_col not in X_new.columns:
+            continue
+        common_segments = sorted(set(X_ref[seg_col].dropna().unique()) & set(X_new[seg_col].dropna().unique()))
+        for seg in common_segments[:25]:
+            ref_seg = X_ref[X_ref[seg_col] == seg]
+            new_seg = X_new[X_new[seg_col] == seg]
+            if len(ref_seg) < 20 or len(new_seg) < 20:
+                continue
+            drifted_features = []
+            for col in num_cols[:50]:
+                if col not in ref_seg.columns or col not in new_seg.columns:
+                    continue
+                ref_vals = ref_seg[col].dropna().values
+                new_vals = new_seg[col].dropna().values
+                if len(ref_vals) < 10 or len(new_vals) < 10:
+                    continue
+                _, pval = scipy_stats.ks_2samp(ref_vals, new_vals)
+                if pval < alpha:
+                    drifted_features.append({"feature": str(col), "pvalue": float(pval)})
+            if drifted_features:
+                drifted_segments.append({
+                    "segment_column": str(seg_col),
+                    "segment_value": str(seg),
+                    "drifted_features": drifted_features[:10],
+                })
+    return {"drifted_segments": drifted_segments}
 
 
 def detect_drift(
@@ -556,10 +761,17 @@ def detect_drift(
     X_test: pd.DataFrame,
     num_cols: list[str],
     cat_cols: list[str],
+    y_train: pd.Series | None = None,
+    y_test: pd.Series | None = None,
+    segment_cols: list[str] | None = None,
 ) -> DriftReport:
-    """UPGRADE 12: KS test (numerical) + chi-squared (categorical) drift detection."""
+    """KS/χ² feature drift plus label, quality, skew, novel-class, and segment checks."""
     log.info("[3c/9] Drift detection (α=%.3f)...", DRIFT_ALPHA)
     report = DriftReport()
+    segment_cols = segment_cols or []
+
+    report.data_quality_drift = _data_quality_drift(X_train, X_test, DRIFT_ALPHA)
+    report.serving_training_skew = _serving_training_skew(X_train, X_test)
 
     for col in num_cols:
         if col not in X_train.columns or col not in X_test.columns:
@@ -577,12 +789,15 @@ def detect_drift(
     for col in cat_cols:
         if col not in X_train.columns or col not in X_test.columns:
             continue
-        all_cats = set(X_train[col].dropna().unique()) | set(X_test[col].dropna().unique())
+        tr_series = X_train[col].dropna()
+        te_series = X_test[col].dropna()
+        tr_vc = tr_series.value_counts()
+        te_vc = te_series.value_counts()
+        all_cats = sorted(set(tr_vc.index) | set(te_vc.index))
         if not all_cats:
             continue
-        cats = sorted(all_cats)
-        tr_counts = np.array([(X_train[col] == c).sum() for c in cats], dtype=float)
-        te_counts = np.array([(X_test[col]  == c).sum() for c in cats], dtype=float)
+        tr_counts = tr_vc.reindex(all_cats, fill_value=0).to_numpy(dtype=float)
+        te_counts = te_vc.reindex(all_cats, fill_value=0).to_numpy(dtype=float)
         if tr_counts.sum() == 0 or te_counts.sum() == 0:
             continue
         # Restrict to categories present in both splits.
@@ -591,7 +806,7 @@ def detect_drift(
         mask = (tr_counts > 0) & (te_counts > 0)
         if mask.sum() < 2:
             continue
-        new_in_test = [cats[i] for i, v in enumerate(tr_counts)
+        new_in_test = [all_cats[i] for i, v in enumerate(tr_counts)
                        if v == 0 and te_counts[i] > 0]
         if new_in_test:
             log.warning("  '%s': %d unseen-in-train category(s) excluded from χ² test: %s",
@@ -604,6 +819,37 @@ def detect_drift(
         if pval < DRIFT_ALPHA:
             report.drifted_categorical.append(col)
             log.warning("  DRIFT detected in '%s' (χ² p=%.4f < %.3f)", col, pval, DRIFT_ALPHA)
+
+    if y_train is not None and y_test is not None:
+        report.label_drift = _distribution_chisquare(y_train, y_test, DRIFT_ALPHA)
+        train_labels = set(pd.Series(y_train).dropna().astype(str).unique())
+        test_labels = set(pd.Series(y_test).dropna().astype(str).unique())
+        novel = sorted(test_labels - train_labels)
+        report.novel_class_emergence = {
+            "novel_classes": novel,
+            "reference_class_count": len(train_labels),
+            "new_class_count": len(test_labels),
+        }
+        if report.label_drift.get("drift_detected"):
+            log.warning(
+                "  LABEL DRIFT detected (χ² p=%.4f < %.3f)",
+                report.label_drift.get("pvalue"), DRIFT_ALPHA,
+            )
+        if novel:
+            log.warning("  NOVEL CLASS emergence detected: %s", novel)
+
+    if segment_cols:
+        report.segment_drift = _segment_drift(X_train, X_test, num_cols, segment_cols, DRIFT_ALPHA)
+        if report.segment_drift.get("drifted_segments"):
+            log.warning(
+                "  SEGMENT DRIFT detected in %d segment(s)",
+                len(report.segment_drift["drifted_segments"]),
+            )
+
+    if report.data_quality_drift.get("drift_detected"):
+        log.warning("  DATA QUALITY DRIFT detected: %s", report.data_quality_drift)
+    if report.serving_training_skew.get("skew_detected"):
+        log.warning("  SERVING/TRAINING SKEW detected: %s", report.serving_training_skew)
 
     total = len(report.drifted_numerical) + len(report.drifted_categorical)
     if total == 0:

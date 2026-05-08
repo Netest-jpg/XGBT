@@ -58,11 +58,12 @@ from xgb_prototype.settings import (
     N_ESTIMATORS_MAX, N_ESTIMATORS_MIN, TUNE_N_ESTIMATORS,
     N_TRIALS, OPTUNA_TIMEOUT, WIDE_SEARCH,
     SEARCH_SUBSAMPLE, EARLY_STOP_RNDS, CV_FOLDS, CV_STRATEGY,
+    SEARCH_BACKEND, SOBOL_ENABLED,
     # pca
     PCA_THRESHOLD, PCA_VARIANCE,
     # features
     FEATURE_SELECTION, CARDINALITY_LIMIT, TARGET_ENC_THRESHOLD,
-    VARIANCE_THRESHOLD, INTERACTION_TOP_K,
+    VARIANCE_THRESHOLD, INTERACTION_TOP_K, AUTO_FE_ENABLED, AUTO_FE_ENGINE,
     # drift
     DRIFT_ALPHA, DRIFT_WARN_ONLY,
     DRIFT_MONITOR_ENABLED, DRIFT_MONITOR_PERSISTENCE,
@@ -71,6 +72,8 @@ from xgb_prototype.settings import (
     # misc model flags
     USE_GPU, PANDERA_VALIDATION, METRIC_NAME, CALIBRATION_ENABLED,
     CB_LOG_PERIOD, TARGET_LOG_TRANSFORM, OUTLIER_CONTAMINATION, PDP_TOP_N,
+    UNCERTAINTY_ENABLED, UNCERTAINTY_ALPHA,
+    UNCERTAINTY_QUANTILE_LOW, UNCERTAINTY_QUANTILE_HIGH,
     # threshold
     THRESHOLD_POLICY,
     # baselines
@@ -91,10 +94,12 @@ from xgb_prototype.metrics import select_metric
 from xgb_prototype.data import (
     load_data, clean_data, validate_data, validate_pandera,
     detect_drift, maybe_log_transform, check_config, apply_pretransforms,
+    automatic_missing_value_report,
 )
 from xgb_prototype.features import (
     detect_feature_types, filter_low_variance,
     generate_feature_interactions, select_features_rfecv,
+    apply_auto_feature_engineering,
 )
 from xgb_prototype.pipeline import (
     _IterationLogCallback, build_pipeline,
@@ -113,6 +118,7 @@ from xgb_prototype.inference import PredictWrapper, ModelServer  # noqa: F401 �
 from xgb_prototype.baselines import evaluate_baselines
 from xgb_prototype.drift_monitor import ContinuousDriftMonitor
 from xgb_prototype.config import to_plain_dict
+from xgb_prototype.uncertainty import estimate_uncertainty
 
 # ── Dependency check ──────────────────────────────────────────────────────────
 
@@ -159,6 +165,7 @@ def main() -> None:
                      if TUNE_N_ESTIMATORS else f"early-stop @ {N_ESTIMATORS_MAX}")
         lines += _section("Search", [
             f"{N_TRIALS} trials",
+            f"backend: {SEARCH_BACKEND}",
             cv_label,
             "wide search" if WIDE_SEARCH else "standard search",
             n_est_lbl,
@@ -169,6 +176,9 @@ def main() -> None:
         core: list = []
         if CALIBRATION_ENABLED:   core.append("calibration")
         if FEATURE_SELECTION:     core.append("RFECV feature selection")
+        if AUTO_FE_ENABLED:       core.append(f"auto feature engineering ({AUTO_FE_ENGINE})")
+        if SOBOL_ENABLED:         core.append("Sobol sensitivity")
+        if UNCERTAINTY_ENABLED:   core.append("uncertainty estimation")
         if PANDERA_VALIDATION:    core.append("Pandera validation")
         if USE_GPU:               core.append("GPU acceleration")
         if TARGET_LOG_TRANSFORM:  core.append("log-transform target")
@@ -237,6 +247,9 @@ def main() -> None:
         check_config(df)
         df = clean_data(df)
         df = apply_pretransforms(df)
+        missing_report = automatic_missing_value_report(
+            df, TARGET_COL, output_dir=MODEL_OUTPUT_DIR, run_id=run_id
+        )
         validate_data(df)
         validate_pandera(df, TARGET_COL)
         log.info("")
@@ -284,7 +297,10 @@ def main() -> None:
         log.info("")
 
         # ── 3c. Drift detection ──────────────────────────────────────────────
-        drift_report = detect_drift(X_train, X_test, num_cols, ohe_cat_cols + te_cat_cols)
+        drift_report = detect_drift(
+            X_train, X_test, num_cols, ohe_cat_cols + te_cat_cols,
+            y_train=y_train, y_test=y_test,
+        )
         log.info("")
 
         # ── 4. Feature engineering ───────────────────────────────────────────
@@ -294,6 +310,11 @@ def main() -> None:
 
         X_train, X_val, X_test, num_cols = generate_feature_interactions(
             X_train, X_val, X_test, num_cols
+        )
+
+        X_train, X_val, X_test, num_cols = apply_auto_feature_engineering(
+            X_train, X_val, X_test, y_train,
+            num_cols, ohe_cat_cols, te_cat_cols,
         )
 
         if FEATURE_SELECTION:
@@ -327,14 +348,16 @@ def main() -> None:
             log.info("  Baseline comparison saved → %s", baseline_path)
         log.info("")
         # ── 5. Optuna tuning ─────────────────────────────────────────────────
-        best_params, study = tune_hyperparameters(
+        best_params, study, search_summary = tune_hyperparameters(
             X_train, y_train, X_val, y_val,
             num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, use_pca,
         )
         log.info("")
 
-        if PLOTS_ENABLED and OPTUNA_PLOTS_ENABLED:
+        if PLOTS_ENABLED and OPTUNA_PLOTS_ENABLED and study is not None:
             plot_optuna_diagnostics(study)
+        elif PLOTS_ENABLED and OPTUNA_PLOTS_ENABLED:
+            log.info("[optuna_plots] [skipped] — search backend did not produce an Optuna study")
 
         # ── Learning curve (before final refit) ──────────────────────────────
         X_trainval = pd.concat([X_train, X_val])
@@ -444,6 +467,21 @@ def main() -> None:
             log_transformed=log_transformed,
         )
         log.info("")
+
+        uncertainty_report = estimate_uncertainty(
+            final_pipeline,
+            X_trainval, y_trainval,
+            X_val, y_val,
+            X_test, y_test,
+            TASK,
+            MODEL_OUTPUT_DIR,
+            run_id,
+            alpha=UNCERTAINTY_ALPHA,
+            quantile_low=UNCERTAINTY_QUANTILE_LOW,
+            quantile_high=UNCERTAINTY_QUANTILE_HIGH,
+            enabled=UNCERTAINTY_ENABLED,
+        )
+
         # ── Ensemble ─────────────────────────────────────────────────────────
         ensemble_path: Path | None = None
         ensemble_summary: dict = {
@@ -529,7 +567,22 @@ def main() -> None:
         }
 
         drift_monitor = None
+        holdout_monitor_report = None
         if DRIFT_MONITOR_ENABLED:
+            ref_predictions = None
+            ref_proba = None
+            holdout_predictions = None
+            holdout_proba = None
+            try:
+                monitor_model = final_pipeline.named_steps["model"]
+                X_train_proc_for_monitor = final_pipeline.named_steps["preprocessor"].transform(X_train)
+                if TASK == "classification" and hasattr(monitor_model, "predict_proba"):
+                    ref_proba = monitor_model.predict_proba(X_train_proc_for_monitor)
+                    holdout_proba = monitor_model.predict_proba(X_test_proc)
+                ref_predictions = monitor_model.predict(X_train_proc_for_monitor)
+                holdout_predictions = monitor_model.predict(X_test_proc)
+            except Exception as exc:
+                log.debug("  Drift monitor prediction references skipped: %s", exc)
             drift_monitor = ContinuousDriftMonitor.from_reference_data(
                 X_train,
                 num_cols=num_cols,
@@ -540,7 +593,16 @@ def main() -> None:
                 retrain_feature_ratio=DRIFT_MONITOR_RETRAIN_RATIO,
                 retrain_severity=DRIFT_MONITOR_RETRAIN_SEVERITY,
                 random_state=RANDOM_STATE,
+                y_ref=y_train,
+                predictions_ref=ref_predictions,
+                prediction_proba_ref=ref_proba,
             )
+            holdout_monitor_report = drift_monitor.check(
+                X_test,
+                y_new=y_test,
+                predictions=holdout_predictions,
+                prediction_proba=holdout_proba,
+            ).to_dict()
             log.info(
                 "  Drift monitor reference captured → %d monitored feature(s)",
                 drift_monitor.feature_count,
@@ -552,6 +614,7 @@ def main() -> None:
         config_snapshot = dict(
             task=TASK, target_col=TARGET_COL, test_size=TEST_SIZE,
             random_state=RANDOM_STATE, cv_folds=CV_FOLDS, cv_strategy=CV_STRATEGY,
+            search_backend=SEARCH_BACKEND,
             data_path=str(PLOT_OUTPUT_DIR.parent / "creditcard.csv"),  # resolved at runtime
             n_trials=N_TRIALS, optuna_timeout=OPTUNA_TIMEOUT,
             n_estimators_max=N_ESTIMATORS_MAX, wide_search=WIDE_SEARCH,
@@ -564,12 +627,19 @@ def main() -> None:
             pdp_top_n=PDP_TOP_N,
             target_log_transform=TARGET_LOG_TRANSFORM,
             interaction_top_k=INTERACTION_TOP_K,
+            auto_feature_engineering=dict(enabled=AUTO_FE_ENABLED, engine=AUTO_FE_ENGINE),
             metric=METRIC_NAME,
             use_gpu=USE_GPU,
             pandera_validation=PANDERA_VALIDATION,
             callback_log_period=CB_LOG_PERIOD,
             variance_threshold=VARIANCE_THRESHOLD,
             calibration_enabled=CALIBRATION_ENABLED,
+            uncertainty=dict(
+                enabled=UNCERTAINTY_ENABLED,
+                alpha=UNCERTAINTY_ALPHA,
+                quantile_alpha_low=UNCERTAINTY_QUANTILE_LOW,
+                quantile_alpha_high=UNCERTAINTY_QUANTILE_HIGH,
+            ),
             threshold_policy=THRESHOLD_POLICY,
             baselines=dict(
                 enabled=BASELINES_ENABLED,
@@ -604,12 +674,21 @@ def main() -> None:
 
         artifact_name = f"model_{timestamp}_{run_id}.joblib"
         model_path    = MODEL_OUTPUT_DIR / artifact_name
+        search_summary_path = MODEL_OUTPUT_DIR / f"search_summary_{run_id}.json"
+        try:
+            import json as _json
+            search_summary_path.write_text(_json.dumps(search_summary, indent=2))
+        except Exception as exc:
+            log.debug("  Search summary write skipped: %s", exc)
         artifact_paths = {
             "model":                str(model_path),
             "ensemble":             str(ensemble_path) if ensemble_path is not None else None,
             "requirements_lock":    str(lock_path),
             "baseline_comparison":  str(baseline_path) if baseline_path is not None else None,
             "error_analysis":       str(error_csv) if error_csv is not None else None,
+            "missing_value_report": missing_report.output_csv,
+            "uncertainty_report":   uncertainty_report.output_csv,
+            "search_summary":       str(search_summary_path),
             "plots_dir":            str(PLOT_OUTPUT_DIR),
         }
 
@@ -633,6 +712,10 @@ def main() -> None:
                 "ensemble_summary":  ensemble_summary,
                 "drift_report":      drift_report.to_dict(),
                 "drift_monitor":     drift_monitor,
+                "holdout_monitor_report": holdout_monitor_report,
+                "missing_value_report": missing_report.to_dict(),
+                "uncertainty_report": uncertainty_report.to_dict(),
+                "search_summary":    search_summary,
                 "threshold_policy":  THRESHOLD_POLICY,
                 "feature_schema":    feature_schema,
                 "artifact_paths":    artifact_paths,
@@ -659,6 +742,9 @@ def main() -> None:
             threshold_policy=THRESHOLD_POLICY,
             feature_schema=feature_schema,
             artifact_paths=artifact_paths,
+            search_summary=search_summary,
+            missing_report=missing_report.to_dict(),
+            uncertainty_report=uncertainty_report.to_dict(),
         )
 
         register_model(
@@ -683,6 +769,11 @@ def main() -> None:
             mlrun.log_artifact(baseline_path)
         if error_csv is not None:
             mlrun.log_artifact(error_csv)
+        mlrun.log_artifact(search_summary_path)
+        if missing_report.output_csv is not None:
+            mlrun.log_artifact(missing_report.output_csv)
+        if uncertainty_report.output_csv is not None:
+            mlrun.log_artifact(uncertainty_report.output_csv)
         for html in PLOT_OUTPUT_DIR.glob("*.html"):
             mlrun.log_artifact(html)
         for png in PLOT_OUTPUT_DIR.glob("*.png"):

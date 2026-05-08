@@ -48,6 +48,40 @@ class EnsembleConfig:
 
 
 @dataclass
+class AutoFeatureEngineeringConfig:
+    enabled: bool = False
+    engine: str = "featuretools"
+    max_features: int = 25
+    max_depth: int = 1
+    entity_id_col: str | None = None
+    time_index_col: str | None = None
+    tsfresh_column_id: str | None = None
+    tsfresh_column_sort: str | None = None
+
+
+@dataclass
+class SearchConfig:
+    backend: str = "optuna"
+    native_xgb_cv_rounds: int = 500
+    native_xgb_cv_early_stop: int = 20
+
+
+@dataclass
+class SobolSensitivityConfig:
+    enabled: bool = False
+    n_base_samples: int = 16
+    max_evals: int = 128
+
+
+@dataclass
+class UncertaintyConfig:
+    enabled: bool = False
+    alpha: float = 0.10
+    quantile_alpha_low: float = 0.05
+    quantile_alpha_high: float = 0.95
+
+
+@dataclass
 class DriftMonitorConfig:
     enabled: bool = True
     persistence: int = 3
@@ -106,6 +140,10 @@ class TrainingConfig:
     baselines: BaselineConfig = field(default_factory=BaselineConfig)
     diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
     ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
+    auto_feature_engineering: AutoFeatureEngineeringConfig = field(default_factory=AutoFeatureEngineeringConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
+    sobol_sensitivity: SobolSensitivityConfig = field(default_factory=SobolSensitivityConfig)
+    uncertainty: UncertaintyConfig = field(default_factory=UncertaintyConfig)
     drift_monitor: DriftMonitorConfig = field(default_factory=DriftMonitorConfig)
     pretransform_log1p_cols: list[str] = field(default_factory=list)
     pretransform_drop_cols:  list[str] = field(default_factory=list)
@@ -136,6 +174,10 @@ def load_config(path: str | Path = "config.yaml") -> TrainingConfig:
         "baselines": _section(BaselineConfig, data, "baselines"),
         "diagnostics": _section(DiagnosticsConfig, data, "diagnostics"),
         "ensemble": _section(EnsembleConfig, data, "ensemble"),
+        "auto_feature_engineering": _section(AutoFeatureEngineeringConfig, data, "auto_feature_engineering"),
+        "search": _section(SearchConfig, data, "search"),
+        "sobol_sensitivity": _section(SobolSensitivityConfig, data, "sobol_sensitivity"),
+        "uncertainty": _section(UncertaintyConfig, data, "uncertainty"),
         "drift_monitor": _section(DriftMonitorConfig, data, "drift_monitor"),
     }
     top_level_fields = set(TrainingConfig.__dataclass_fields__) - set(nested)

@@ -42,13 +42,18 @@ log_file: null              # null = stdout only; path = write to file e.g. "tra
 #   cv_folds > 0  → always use CV with that many folds
 #   cv_folds = 0  → always use fast-path subsample
 #   cv_folds = -1 → auto: CV when n_rows < 50k, fast-path otherwise (recommended)
-cv_folds: 5
+cv_folds: -1
 cv_strategy: stratified     # "stratified" | "timeseries"
 
 
 # ─────────────────────────────────────────────
-#  OPTUNA HYPERPARAMETER SEARCH
+#  HYPERPARAMETER SEARCH
 # ─────────────────────────────────────────────
+search:
+  backend: optuna             # "optuna" | "native_xgb_cv"
+  native_xgb_cv_rounds: 500   # used when backend=native_xgb_cv
+  native_xgb_cv_early_stop: 20
+
 n_trials: 30
 optuna_budget_seconds: null # wall-clock budget cap (overrides n_trials when set)
 optuna_timeout: null        # per-trial timeout in seconds
@@ -66,6 +71,13 @@ early_stop_rnds: 20         # rounds without improvement before early stopping t
 
 # Broader search space (more trials recommended alongside this)
 wide_search: false          # true → broader hyperparameter ranges
+
+# Sobol sensitivity analysis for max_depth, learning_rate, and subsample.
+# Helps identify which parameters actually move the validation metric.
+sobol_sensitivity:
+  enabled: false
+  n_base_samples: 16
+  max_evals: 128
 
 
 # ─────────────────────────────────────────────
@@ -91,6 +103,18 @@ target_encoding_threshold: 50  # object columns with > N unique values → Targe
 # Feature interaction expansion
 interaction_top_k: 10       # max correlated numeric feature pairs to generate cross-features
 
+# Optional automated feature engineering. Featuretools is the default for
+# generic tabular data; tsfresh is available for long/time-series tables.
+auto_feature_engineering:
+  enabled: false
+  engine: featuretools       # "featuretools" | "tsfresh"
+  max_features: 25
+  max_depth: 1
+  entity_id_col: null
+  time_index_col: null
+  tsfresh_column_id: null
+  tsfresh_column_sort: null
+
 
 # ─────────────────────────────────────────────
 #  PCA
@@ -109,7 +133,7 @@ imbalance_threshold: 0.15   # minority class ratio below this triggers imbalance
 # ─────────────────────────────────────────────
 #  FEATURE SELECTION
 # ─────────────────────────────────────────────
-feature_selection: true     # run RFECV before Optuna to drop low-value features
+feature_selection: false    # RFECV is powerful but expensive; enable for slower audit runs
 
 
 # ─────────────────────────────────────────────
@@ -154,6 +178,15 @@ threshold_policy:
 #  CALIBRATION
 # ─────────────────────────────────────────────
 calibration_enabled: true   # post-hoc probability calibration on validation predictions
+
+# ─────────────────────────────────────────────
+#  UNCERTAINTY ESTIMATION
+# ─────────────────────────────────────────────
+uncertainty:
+  enabled: false
+  alpha: 0.10                # 90% conformal coverage target
+  quantile_alpha_low: 0.05   # regression quantile lower bound
+  quantile_alpha_high: 0.95  # regression quantile upper bound
 
 
 # ─────────────────────────────────────────────

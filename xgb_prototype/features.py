@@ -15,6 +15,9 @@ from xgboost import XGBClassifier, XGBRegressor
 from .settings import (
     CARDINALITY_LIMIT, TARGET_ENC_THRESHOLD, RANDOM_STATE,
     VARIANCE_THRESHOLD, INTERACTION_TOP_K,
+    AUTO_FE_ENABLED, AUTO_FE_ENGINE, AUTO_FE_MAX_FEATURES, AUTO_FE_MAX_DEPTH,
+    AUTO_FE_ENTITY_ID_COL, AUTO_FE_TIME_INDEX_COL,
+    AUTO_FE_TSFRESH_COLUMN_ID, AUTO_FE_TSFRESH_COLUMN_SORT,
 )
 from .metrics import MetricConfig
 
@@ -137,6 +140,198 @@ def generate_feature_interactions(
     log.info("  [InteractionGen] Added %d interaction feature(s) → num_cols: %d → %d",
              len(new_cols), len(num_cols), len(extended))
     return X_train, X_val, X_test, extended
+
+
+def apply_auto_feature_engineering(
+    X_train: pd.DataFrame,
+    X_val: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y_train: pd.Series,
+    num_cols: list[str],
+    ohe_cat_cols: list[str],
+    te_cat_cols: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
+    """Opt-in automated feature generation with Featuretools or tsfresh.
+
+    The generated columns are appended as numerical features. The function is
+    intentionally conservative: it caps generated columns and skips cleanly when
+    an optional backend is unavailable or the data does not fit that backend.
+    """
+    if not AUTO_FE_ENABLED:
+        log.info("  [AutoFE] skipped — auto_feature_engineering.enabled=false")
+        return X_train, X_val, X_test, num_cols
+
+    engine = AUTO_FE_ENGINE.lower()
+    if engine == "featuretools":
+        return _apply_featuretools(
+            X_train, X_val, X_test, num_cols, ohe_cat_cols + te_cat_cols
+        )
+    if engine == "tsfresh":
+        return _apply_tsfresh(X_train, X_val, X_test, y_train, num_cols)
+
+    log.warning("  [AutoFE] unknown engine='%s' — skipped", AUTO_FE_ENGINE)
+    return X_train, X_val, X_test, num_cols
+
+
+def _featuretools_entityset(X: pd.DataFrame, ft):
+    frame = X.reset_index(drop=True).copy()
+    row_id = "__autofe_row_id"
+    if row_id in frame.columns:
+        row_id = "__autofe_row_id__"
+    frame[row_id] = np.arange(len(frame))
+    es = ft.EntitySet(id="xgb_prototype_autofe")
+    kwargs = {"dataframe_name": "observations", "dataframe": frame, "index": row_id}
+    if AUTO_FE_TIME_INDEX_COL and AUTO_FE_TIME_INDEX_COL in frame.columns:
+        kwargs["time_index"] = AUTO_FE_TIME_INDEX_COL
+    es = es.add_dataframe(**kwargs)
+    return es
+
+
+def _clean_generated_features(
+    matrix: pd.DataFrame,
+    original_cols: set[str],
+    prefix: str,
+    keep_raw: list[str] | None = None,
+) -> pd.DataFrame:
+    generated = matrix.drop(columns=[c for c in matrix.columns if c in original_cols], errors="ignore")
+    generated = generated.select_dtypes(include=["number"]).replace([np.inf, -np.inf], np.nan)
+    if generated.empty:
+        return generated
+    if keep_raw is None:
+        variances = generated.var(numeric_only=True).sort_values(ascending=False)
+        keep = [c for c in variances.index if variances.loc[c] > 0][:AUTO_FE_MAX_FEATURES]
+    else:
+        keep = [c for c in keep_raw if c in generated.columns]
+    generated = generated[keep].copy()
+    generated.columns = [f"{prefix}{str(c).replace(' ', '_')[:80]}" for c in generated.columns]
+    return generated
+
+
+def _apply_featuretools(
+    X_train: pd.DataFrame,
+    X_val: pd.DataFrame,
+    X_test: pd.DataFrame,
+    num_cols: list[str],
+    cat_cols: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
+    try:
+        import featuretools as ft
+    except ImportError:
+        log.warning("  [AutoFE] featuretools not installed — skipped.")
+        return X_train, X_val, X_test, num_cols
+
+    numeric_source = [c for c in num_cols if c in X_train.columns]
+    if len(numeric_source) < 2:
+        log.info("  [AutoFE] Featuretools skipped — fewer than 2 numerical columns.")
+        return X_train, X_val, X_test, num_cols
+
+    log.info(
+        "[AutoFE] Featuretools enabled (max_depth=%d, max_features=%d)...",
+        AUTO_FE_MAX_DEPTH, AUTO_FE_MAX_FEATURES,
+    )
+    try:
+        primitives = ["add_numeric", "multiply_numeric"]
+        original_cols = set(X_train.columns)
+        train_matrix, feature_defs = ft.dfs(
+            entityset=_featuretools_entityset(X_train, ft),
+            target_dataframe_name="observations",
+            trans_primitives=primitives,
+            agg_primitives=[],
+            max_depth=AUTO_FE_MAX_DEPTH,
+            features_only=False,
+            verbose=False,
+        )
+        raw_generated = train_matrix.drop(
+            columns=[c for c in train_matrix.columns if c in original_cols],
+            errors="ignore",
+        ).select_dtypes(include=["number"]).replace([np.inf, -np.inf], np.nan)
+        raw_variances = raw_generated.var(numeric_only=True).sort_values(ascending=False)
+        keep_raw = [c for c in raw_variances.index if raw_variances.loc[c] > 0][:AUTO_FE_MAX_FEATURES]
+        train_gen = _clean_generated_features(train_matrix, original_cols, "ft__", keep_raw=keep_raw)
+        if train_gen.empty:
+            log.info("  [AutoFE] Featuretools produced no usable numeric features.")
+            return X_train, X_val, X_test, num_cols
+
+        def _calc(X: pd.DataFrame) -> pd.DataFrame:
+            matrix = ft.calculate_feature_matrix(
+                features=feature_defs,
+                entityset=_featuretools_entityset(X, ft),
+                verbose=False,
+            )
+            gen = _clean_generated_features(matrix, original_cols, "ft__", keep_raw=keep_raw)
+            return gen.reindex(columns=train_gen.columns)
+
+        val_gen = _calc(X_val)
+        test_gen = _calc(X_test)
+    except Exception as exc:
+        log.warning("  [AutoFE] Featuretools failed (%s) — skipped.", exc)
+        return X_train, X_val, X_test, num_cols
+
+    X_train_out = pd.concat([X_train.reset_index(drop=True), train_gen.reset_index(drop=True)], axis=1)
+    X_val_out = pd.concat([X_val.reset_index(drop=True), val_gen.reset_index(drop=True)], axis=1)
+    X_test_out = pd.concat([X_test.reset_index(drop=True), test_gen.reset_index(drop=True)], axis=1)
+    new_cols = train_gen.columns.tolist()
+    log.info("  [AutoFE] Added %d Featuretools feature(s): %s", len(new_cols), new_cols[:10])
+    return X_train_out, X_val_out, X_test_out, num_cols + new_cols
+
+
+def _apply_tsfresh(
+    X_train: pd.DataFrame,
+    X_val: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y_train: pd.Series,
+    num_cols: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
+    try:
+        from tsfresh import extract_features
+        from tsfresh.feature_extraction import MinimalFCParameters
+    except ImportError:
+        log.warning("  [AutoFE] tsfresh not installed — skipped.")
+        return X_train, X_val, X_test, num_cols
+
+    id_col = AUTO_FE_TSFRESH_COLUMN_ID or AUTO_FE_ENTITY_ID_COL
+    sort_col = AUTO_FE_TSFRESH_COLUMN_SORT or AUTO_FE_TIME_INDEX_COL
+    if not id_col or id_col not in X_train.columns:
+        log.warning("  [AutoFE] tsfresh requires tsfresh_column_id/entity_id_col — skipped.")
+        return X_train, X_val, X_test, num_cols
+
+    value_cols = [c for c in num_cols if c in X_train.columns and c not in {id_col, sort_col}]
+    if not value_cols:
+        log.warning("  [AutoFE] tsfresh found no numeric value columns — skipped.")
+        return X_train, X_val, X_test, num_cols
+
+    def _extract(X: pd.DataFrame) -> pd.DataFrame:
+        cols = [id_col] + ([sort_col] if sort_col and sort_col in X.columns else []) + value_cols
+        feats = extract_features(
+            X[cols],
+            column_id=id_col,
+            column_sort=sort_col if sort_col in X.columns else None,
+            default_fc_parameters=MinimalFCParameters(),
+            disable_progressbar=True,
+            n_jobs=0,
+        )
+        feats = feats.select_dtypes(include=["number"]).replace([np.inf, -np.inf], np.nan)
+        keep = feats.var(numeric_only=True).sort_values(ascending=False).head(AUTO_FE_MAX_FEATURES).index
+        feats = feats[keep].add_prefix("tsfresh__")
+        return feats
+
+    try:
+        train_gen = _extract(X_train)
+        val_gen = _extract(X_val).reindex(columns=train_gen.columns)
+        test_gen = _extract(X_test).reindex(columns=train_gen.columns)
+    except Exception as exc:
+        log.warning("  [AutoFE] tsfresh failed (%s) — skipped.", exc)
+        return X_train, X_val, X_test, num_cols
+
+    key_train = X_train[id_col].reset_index(drop=True)
+    key_val = X_val[id_col].reset_index(drop=True)
+    key_test = X_test[id_col].reset_index(drop=True)
+    X_train_out = pd.concat([X_train.reset_index(drop=True), train_gen.reindex(key_train).reset_index(drop=True)], axis=1)
+    X_val_out = pd.concat([X_val.reset_index(drop=True), val_gen.reindex(key_val).reset_index(drop=True)], axis=1)
+    X_test_out = pd.concat([X_test.reset_index(drop=True), test_gen.reindex(key_test).reset_index(drop=True)], axis=1)
+    new_cols = train_gen.columns.tolist()
+    log.info("  [AutoFE] Added %d tsfresh feature(s): %s", len(new_cols), new_cols[:10])
+    return X_train_out, X_val_out, X_test_out, num_cols + new_cols
 
 
 def select_features_rfecv(

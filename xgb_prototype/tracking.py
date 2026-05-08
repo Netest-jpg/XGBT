@@ -222,6 +222,9 @@ def train_summary(
     threshold_policy: dict | None = None,
     feature_schema: dict | None = None,
     artifact_paths: dict | None = None,
+    search_summary: dict | None = None,
+    missing_report: dict | None = None,
+    uncertainty_report: dict | None = None,
 ) -> None:
     """
     UPGRADE 20: Concise post-run summary table + JSON run report.
@@ -237,6 +240,8 @@ def train_summary(
     log.info("  Artifact        : %s", model_path)
     log.info("  Best n_estimators: %d", best_n)
     log.info("  Best threshold  : %.4f", best_threshold)
+    if search_summary:
+        log.info("  Search backend  : %s", search_summary.get("backend", "unknown"))
     for k, v in eval_metrics.items():
         log.info("  %-16s: %.4f", k, v)
     if drift_report.any_drift:
@@ -261,6 +266,9 @@ def train_summary(
         "threshold_policy":  threshold_policy or {},
         "feature_schema":    feature_schema or {},
         "drift":             drift_report.to_dict(),
+        "search_summary":    search_summary or {},
+        "missing_report":    missing_report or {},
+        "uncertainty_report": uncertainty_report or {},
         "task":              task,
         "target_col":        target_col,
         "artifact_paths":    artifact_paths or {},

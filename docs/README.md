@@ -71,7 +71,9 @@ Finally, adjust the configs according to your dataset.
 
 ## 1. Project Overview
 
-This project is a generalized XGBoost training prototype. It is configured through `config.yaml`, supports classification and regression, runs Optuna hyperparameter tuning, compares simple baselines, writes versioned model artifacts, generates diagnostics, and exposes stable inference wrappers.
+This project is a generalized XGBoost training prototype. It is configured through `config.yaml`, supports classification and regression, runs Optuna or native `xgboost.cv` tuning, compares simple baselines, writes versioned model artifacts, generates diagnostics, and exposes stable inference wrappers.
+
+Recent monitoring additions include feature drift, concept-drift proxies, label drift, novel class emergence, prediction drift, data quality drift, serving/training skew, segment drift, model calibration drift, and an automatic missing-value report. Optional advanced paths add Featuretools/tsfresh feature generation, Sobol sensitivity analysis for `max_depth`, `learning_rate`, and `subsample`, and uncertainty estimation with conformal prediction plus regression quantile intervals.
 
 The current sample dataset is `creditcard.csv`, but the code is intentionally not fraud-specific. The same pipeline works across many tabular datasets by changing configuration values rather than editing code.
 
@@ -104,12 +106,14 @@ The current sample dataset is `creditcard.csv`, but the code is intentionally no
 │   ├── settings.py              # Module-level config constants
 │   ├── thresholds.py            # Binary threshold tuning policies
 │   ├── tracking.py              # MLflow integration
+│   ├── uncertainty.py           # Conformal prediction + quantile intervals
 │   └── train.py                 # Main training orchestration
 └── tests/
     ├── test_config.py
     ├── test_data_loading_and_temporal.py
     ├── test_drift_monitor.py
     ├── test_feature_inference.py
+    ├── test_monitoring_reports.py
     ├── test_serving.py
     ├── test_smoke_training.py
     └── test_thresholds.py
@@ -284,16 +288,22 @@ log_file: null              # null = console only; path = console + file
 ### Cross-validation settings
 
 ```yaml
-cv_folds: 5                 # 0 = faster validation-split path
+cv_folds: -1                # -1 = auto, 0 = fastest validation-split path, N = force N folds
 cv_strategy: stratified     # stratified | timeseries
 ```
-`cv_folds`: Number of folds used during Optuna tuning.
-Use `cv_folds: 0` for a quick first run on a large dataset.
-Use `cv_folds: 5` for a reliable search.
+`cv_folds`: Number of folds used during search.
+Use `cv_folds: -1` for the default auto mode: cross-validation on smaller datasets, validation-split subsampling on larger datasets.
+Use `cv_folds: 0` for the fastest first run.
+Use `cv_folds: 5` for a slower, lower-variance search.
 
-### Optuna search settings
+### Search settings
 
 ```yaml
+search:
+  backend: optuna           # optuna | native_xgb_cv
+  native_xgb_cv_rounds: 500
+  native_xgb_cv_early_stop: 20
+
 n_trials: 30        # number of hyperparameter trials.
 
 optuna_timeout: null        # null = run until n_trials; integer = max seconds
@@ -306,6 +316,22 @@ early_stop_rnds: 20       # stop after this many rounds without validation impro
 
 wide_search: false          # true = expanded search ranges
 ```
+
+`search.backend: optuna` tunes the full hyperparameter space. Trial scoring uses XGBoost's native `DMatrix`/`train` API after preprocessing, which is faster and lower-memory than repeatedly fitting sklearn wrappers.
+
+`search.backend: native_xgb_cv` uses XGBoost's built-in CV to select the boosting depth quickly. It is the fastest backend, but it does not explore the full Optuna search space.
+
+For large datasets, start with:
+
+```yaml
+cv_folds: 0
+search_subsample: 0.3
+diagnostics:
+  plots_enabled: false
+feature_selection: false
+```
+
+Then increase `n_trials`, `cv_folds`, and diagnostics only after the data and metric look sane.
 
 ### PCA settings
 
@@ -948,19 +974,23 @@ Integer columns with ≤ `cardinality_limit` unique values are treated as catego
 
 `OneHotEncoder(handle_unknown="ignore")`: outputs all-zeros for unseen categories at inference rather than raising. Essential for production. `sparse_output=False` returns a dense array, required by XGBoost.
 
-`nthread=1`: prevents XGBoost from spawning its own thread pool inside each Optuna trial. The outer `study.optimize(n_jobs=-1)` handles trial-level parallelism; XGBoost's thread pool would cause oversubscription.
+Optuna trials are scored with XGBoost's native `DMatrix`/`train` API after the sklearn preprocessor has been fitted once. This keeps the final exported model as a normal sklearn pipeline while avoiding repeated sklearn-wrapper overhead inside the search loop.
 
-`n_jobs=-1` on `ColumnTransformer`: parallelises the num/cat/te branches across CPU cores, the dominant source of speedup during Optuna trials.
+Preprocessed float matrices are cast to `float32` before repeated XGBoost scoring, reducing memory pressure on wide one-hot encoded datasets.
+
+`nthread=1` is used inside parallel CV folds to avoid CPU oversubscription. In single validation-split scoring, XGBoost can use its own threads.
 
 ### Optuna tuning (`tune_hyperparameters`)
 
-Two modes: `cv_folds > 0` uses cross-validation (slower, lower variance); `cv_folds = 0` uses a stratified subsample of the training data (faster, noisier). The subsample mode is sufficient for ranking parameter combinations — it does not need to measure exact performance.
+Two modes: `cv_folds > 0` uses cross-validation (slower, lower variance); `cv_folds = 0` uses a stratified subsample of the training data (faster, noisier); `cv_folds = -1` chooses automatically based on row count. The subsample mode is sufficient for ranking parameter combinations — it does not need to measure exact performance.
+
+`search.backend: native_xgb_cv` bypasses Optuna and uses XGBoost's built-in CV to choose `n_estimators` quickly from the default parameter set. Use it for fast benchmarks, CI smoke runs, or quick dataset checks.
 
 TPE sampler with `n_startup_trials=10`: the first 10 trials use random search to seed the TPE model, preventing it from getting trapped in a bad early configuration.
 
 MedianPruner with `n_warmup_steps=10`: terminates trials performing significantly below the median. The 10-step warmup lets each trial produce a meaningful early score before pruning decisions.
 
-`n_jobs=-1` for subsample mode, `n_jobs=1` for CV mode: parallel trials with inner CV fold parallelism causes thread contention.
+Optuna itself runs one trial at a time by default because each trial may already use XGBoost threads or parallel CV folds. This avoids nested parallelism, which is often slower than it looks on paper.
 
 ### Final fit / refit (`main` steps 6–6b)
 
@@ -986,6 +1016,8 @@ The default F1 at threshold 0.5 is logged alongside the tuned threshold so the p
 `detect_drift` compares train vs test splits from the *same* dataset. For datasets randomly split, this measures natural sampling variance and will rarely flag drift. The intended use is when train and test come from different time periods or data sources. Interpret results cautiously on standard random splits.
 
 The `ContinuousDriftMonitor` (separate from `detect_drift`) handles production-time drift monitoring on incoming batches.
+
+The drift checks use vectorised `value_counts`/aligned distributions for categorical and label drift rather than scanning each category one by one, which matters on high-cardinality columns.
 
 ### Interaction features (`generate_feature_interactions`)
 
