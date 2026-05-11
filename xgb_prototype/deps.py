@@ -20,6 +20,7 @@ _SOFT = [
     ("SALib",              "SALib",              "1.5.0"),
     ("featuretools",       "featuretools",       "1.31.0"),
     ("tsfresh",            "tsfresh",            "0.21.0"),
+    ("shap",               "shap",               "0.46.0"),
 ]
 
 

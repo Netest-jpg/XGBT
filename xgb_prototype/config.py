@@ -39,6 +39,9 @@ class DiagnosticsConfig:
     outlier_report: bool = True
     partial_dependence: bool = True
     pca_plots: bool = True
+    shap: bool = True
+    calibration_curve: bool = True
+    corr_heatmap: bool = True
 
 
 @dataclass

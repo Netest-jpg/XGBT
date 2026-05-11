@@ -85,6 +85,7 @@ from xgb_prototype.settings import (
     PLOTS_ENABLED, OPTUNA_PLOTS_ENABLED, LEARNING_CURVE_ENABLED,
     PERM_IMPORTANCE_ENABLED, THRESHOLD_SWEEP_ENABLED,
     OUTLIER_REPORT_ENABLED, PDP_ENABLED, PCA_PLOTS_ENABLED,
+    SHAP_ENABLED, CALIBRATION_CURVE_ENABLED, CORR_HEATMAP_ENABLED,
     # mlflow
     MLFLOW_URI, MLFLOW_EXPERIMENT,
     # typed config
@@ -110,6 +111,8 @@ from xgb_prototype.plots import (
     plot_feature_importance, plot_optuna_diagnostics, plot_learning_curve,
     plot_permutation_importance, plot_threshold_sweep, plot_outlier_report,
     plot_partial_dependence, plot_pca_diagnostics,
+    plot_shap_summary, plot_shap_interactions,
+    plot_calibration_curve, plot_correlation_heatmap,
 )
 from xgb_prototype.tracking import (
     _MLflowRun, write_requirements_lock, register_model, train_summary,
@@ -208,6 +211,9 @@ def main() -> None:
             if OUTLIER_REPORT_ENABLED:  diag.append("outlier report")
             if PDP_ENABLED:             diag.append(f"partial dependence (top {PDP_TOP_N})")
             if PCA_PLOTS_ENABLED:       diag.append("PCA plots")
+            if SHAP_ENABLED:            diag.append("SHAP summary + interactions")
+            if CALIBRATION_CURVE_ENABLED: diag.append("calibration curve")
+            if CORR_HEATMAP_ENABLED:    diag.append("correlation heatmap")
             if diag:
                 lines += _section("Diagnostics", diag)
 
@@ -386,7 +392,7 @@ def main() -> None:
                 n_estimators=best_n, early_stop=0, use_pca=use_pca,
             )
             preprocessor  = refit_pipeline.named_steps["preprocessor"]
-            X_tv_proc     = preprocessor.fit_transform(X_trainval, y_trainval)
+            X_tv_proc     = preprocessor.fit_transform(X_trainval, y_trainval.astype(float))
             X_val_proc    = preprocessor.transform(X_val)
             X_test_proc   = preprocessor.transform(X_test)
             _refit_cb     = _IterationLogCallback(period=CB_LOG_PERIOD, label="final")
@@ -403,7 +409,7 @@ def main() -> None:
                 n_estimators=N_ESTIMATORS_MAX, early_stop=30, use_pca=use_pca,
             )
             preprocessor  = final_pipeline.named_steps["preprocessor"]
-            X_tv_proc     = preprocessor.fit_transform(X_trainval, y_trainval)
+            X_tv_proc     = preprocessor.fit_transform(X_trainval, y_trainval.astype(float))
             X_val_proc    = preprocessor.transform(X_val)
             X_test_proc   = preprocessor.transform(X_test)
 
@@ -557,6 +563,25 @@ def main() -> None:
                 log.info("[pca_plots] [skipped] — PCA not active")
             else:
                 log.info("[pca_plots] [skipped]")
+            if SHAP_ENABLED:
+                plot_shap_summary(
+                    final_pipeline, X_test,
+                    num_cols, ohe_cat_cols, te_cat_cols, use_pca, TASK,
+                )
+                plot_shap_interactions(
+                    final_pipeline, X_test,
+                    num_cols, ohe_cat_cols, te_cat_cols, use_pca,
+                )
+            else:
+                log.info("[shap] [skipped]")
+            if CALIBRATION_CURVE_ENABLED:
+                plot_calibration_curve(final_pipeline, X_val, y_val, TASK)
+            else:
+                log.info("[calibration_curve] [skipped]")
+            if CORR_HEATMAP_ENABLED:
+                plot_correlation_heatmap(X_train, num_cols)
+            else:
+                log.info("[corr_heatmap] [skipped]")
         else:
             log.info("[8/9] Plots [skipped]")
 

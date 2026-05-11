@@ -500,7 +500,7 @@ def tune_hyperparameters(
     _prep_pipe = build_pipeline(num_cols, ohe_cat_cols, te_cat_cols, task, metric, use_pca=use_pca)
     preprocessor = _prep_pipe.named_steps["preprocessor"]
     with joblib.parallel_backend("loky", n_jobs=-1):
-        X_train_proc = _as_xgb_matrix(preprocessor.fit_transform(X_train, y_train))
+        X_train_proc = _as_xgb_matrix(preprocessor.fit_transform(X_train, pd.Series(y_train).astype(float)))
         X_val_proc   = _as_xgb_matrix(preprocessor.transform(X_val))
     y_train_arr = np.array(y_train)
     y_val_arr   = np.array(y_val)

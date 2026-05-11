@@ -21,6 +21,7 @@ dependencies = [
     "SALib>=1.5.1",
     "featuretools>=1.31.0",
     "tsfresh>=0.21.0",
+    "shap>=0.50.0",
     "setuptools>=69.0,<81.0",
 ]
 

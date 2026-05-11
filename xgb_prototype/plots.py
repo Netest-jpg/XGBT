@@ -504,3 +504,381 @@ def plot_partial_dependence(
             log.info("    PDP → %s", path_png)
         except Exception as e:
             log.warning("    PDP failed for '%s': %s", fname, e)
+
+
+def _extract_booster_and_feature_names(
+    pipeline: Pipeline,
+    num_cols: list[str],
+    ohe_cat_cols: list[str],
+    te_cat_cols: list[str],
+    use_pca: bool,
+):
+    """Shared helper: unwrap calibration/ensemble wrapper → raw XGBModel + feature names."""
+    prep = pipeline.named_steps["preprocessor"]
+    model_step = pipeline.named_steps["model"]
+
+    # Unwrap CalibratedClassifierCV or similar wrappers
+    base_model = model_step
+    if hasattr(model_step, "calibrated_classifiers_"):
+        base_model = model_step.calibrated_classifiers_[0].estimator
+    elif hasattr(model_step, "estimator"):
+        base_model = model_step.estimator
+
+    booster = base_model.get_booster()
+
+    # Build feature names matching the preprocessed matrix column order
+    num_pipe = prep.named_transformers_.get("num")
+    if use_pca and num_pipe is not None and "pca" in num_pipe.named_steps:
+        pca = num_pipe.named_steps["pca"]
+        n_comp = pca.n_components_ if hasattr(pca, "n_components_") else pca.components_.shape[0]
+        feat_names: list[str] = [f"PC{i+1}" for i in range(n_comp)]
+    else:
+        feat_names = list(num_cols)
+
+    if ohe_cat_cols:
+        ohe = prep.named_transformers_["cat"].named_steps["encoder"]
+        feat_names.extend(ohe.get_feature_names_out(ohe_cat_cols).tolist())
+    if te_cat_cols:
+        feat_names.extend(te_cat_cols)
+
+    return booster, base_model, feat_names
+
+
+def plot_shap_summary(
+    pipeline: Pipeline,
+    X_test: pd.DataFrame,
+    num_cols: list[str],
+    ohe_cat_cols: list[str],
+    te_cat_cols: list[str],
+    use_pca: bool,
+    task: str,
+    *,
+    max_display: int = 20,
+    max_samples: int = 2_000,
+) -> None:
+    """SHAP beeswarm summary plot using TreeExplainer on the raw booster.
+
+    Extracts the booster from inside the sklearn Pipeline (unwrapping any
+    CalibratedClassifierCV wrapper), runs SHAP on the preprocessed test
+    matrix, then saves an interactive Plotly HTML beeswarm.
+    """
+    try:
+        import shap  # noqa: F401
+    except ImportError:
+        log.warning("  [shap] shap not installed — skipping SHAP plots. "
+                    "Install with: pip install shap")
+        return
+
+    log.info("  Computing SHAP values (TreeExplainer)...")
+    try:
+        booster, base_model, feat_names = _extract_booster_and_feature_names(
+            pipeline, num_cols, ohe_cat_cols, te_cat_cols, use_pca
+        )
+        prep = pipeline.named_steps["preprocessor"]
+        X_proc = prep.transform(X_test)
+        
+        # Subsample for speed on large test sets
+        rng = np.random.default_rng(RANDOM_STATE)
+        n = X_proc.shape[0]
+        if n > max_samples:
+            idx = rng.choice(n, size=max_samples, replace=False)
+            X_proc = X_proc[idx]
+
+        explainer = shap.TreeExplainer(booster)
+        shap_values = explainer(X_proc)
+
+        # For multiclass shap returns shape (n, features, classes) — take class-1 slice
+        sv = shap_values.values
+        if sv.ndim == 3:
+            sv = sv[:, :, 1]
+
+        n_feat = min(len(feat_names), sv.shape[1])
+        names_trimmed = feat_names[:n_feat]
+        sv = sv[:, :n_feat]
+
+        # Build beeswarm data: one point per (sample, feature), jittered on y
+        mean_abs = np.abs(sv).mean(axis=0)
+        order = np.argsort(mean_abs)[::-1][:max_display]
+        display_names = [names_trimmed[i] for i in order]
+        display_sv = sv[:, order]
+
+        # Normalise feature values for colouring (use raw processed data)
+        X_display = X_proc[:, order[:n_feat]]
+        feat_min = X_display.min(axis=0)
+        feat_max = X_display.max(axis=0)
+        feat_range = np.where(feat_max - feat_min == 0, 1.0, feat_max - feat_min)
+        feat_norm = (X_display - feat_min) / feat_range  # 0–1 per feature
+
+        rng2 = np.random.default_rng(RANDOM_STATE + 1)
+        fig = go.Figure()
+        for fi in range(len(display_names) - 1, -1, -1):  # bottom to top
+            shap_col = display_sv[:, fi]
+            color_col = feat_norm[:, fi] if fi < feat_norm.shape[1] else np.zeros(len(shap_col))
+            jitter = rng2.uniform(-0.35, 0.35, size=len(shap_col))
+            fig.add_trace(go.Scatter(
+                x=shap_col,
+                y=np.full(len(shap_col), fi) + jitter,
+                mode="markers",
+                marker=dict(
+                    color=color_col,
+                    colorscale="RdBu_r",
+                    cmin=0, cmax=1,
+                    size=4, opacity=0.7,
+                    colorbar=dict(
+                        title="Feature value<br>(low → high)",
+                        thickness=12, len=0.5,
+                        tickvals=[0, 1], ticktext=["Low", "High"],
+                    ) if fi == 0 else None,
+                    showscale=(fi == 0),
+                ),
+                hovertemplate=f"<b>{display_names[fi]}</b><br>SHAP: %{{x:.4f}}<extra></extra>",
+                name=display_names[fi],
+                showlegend=False,
+            ))
+
+        fig.add_vline(x=0, line_dash="dash", line_color="gray", line_width=1)
+        fig.update_layout(
+            title=f"SHAP Summary — top {len(display_names)} features "
+                  f"(n={X_proc.shape[0]:,}, TreeExplainer)",
+            xaxis_title="SHAP value (impact on model output)",
+            yaxis=dict(
+                tickvals=list(range(len(display_names))),
+                ticktext=display_names,
+                title="",
+                fixedrange=False,
+            ),
+            template="simple_white",
+            height=max(400, 30 * len(display_names)),
+        )
+        path = PLOT_OUTPUT_DIR / "shap_summary.html"
+        fig.write_html(str(path), include_plotlyjs="cdn")
+        log.info("  SHAP summary → %s", path)
+
+    except Exception as e:
+        log.warning("  SHAP summary failed (skipping): %s", e)
+
+
+def plot_shap_interactions(
+    pipeline: Pipeline,
+    X_test: pd.DataFrame,
+    num_cols: list[str],
+    ohe_cat_cols: list[str],
+    te_cat_cols: list[str],
+    use_pca: bool,
+    *,
+    top_n: int = 10,
+    max_samples: int = 500,
+) -> None:
+    """SHAP interaction heatmap (mean |SHAP interaction value| matrix).
+
+    Interaction values are O(n² features) so we cap samples and features
+    aggressively to keep runtime reasonable.
+    """
+    try:
+        import shap  # noqa: F401
+    except ImportError:
+        return  # already warned in plot_shap_summary
+
+    log.info("  Computing SHAP interaction values (top-%d features, n≤%d)...", top_n, max_samples)
+    try:
+        booster, _, feat_names = _extract_booster_and_feature_names(
+            pipeline, num_cols, ohe_cat_cols, te_cat_cols, use_pca
+        )
+        prep = pipeline.named_steps["preprocessor"]
+        X_proc = prep.transform(X_test)
+
+        rng = np.random.default_rng(RANDOM_STATE)
+        n = X_proc.shape[0]
+        if n > max_samples:
+            idx = rng.choice(n, size=max_samples, replace=False)
+            X_proc = X_proc[idx]
+
+        explainer = shap.TreeExplainer(booster)
+        # shap_interaction_values shape: (n_samples, n_features, n_features)
+        interaction_values = explainer.shap_interaction_values(X_proc)
+
+        # For multiclass it returns a list — take class-1
+        if isinstance(interaction_values, list):
+            interaction_values = interaction_values[1]
+
+        # Trim to available feature names
+        n_feat = min(len(feat_names), interaction_values.shape[1])
+        names_trimmed = feat_names[:n_feat]
+        interaction_values = interaction_values[:, :n_feat, :n_feat]
+
+        # Select top-N features by mean absolute main-effect (diagonal)
+        main_effects = np.abs(interaction_values[:, range(n_feat), range(n_feat)]).mean(axis=0)
+        top_idx = np.argsort(main_effects)[::-1][:min(top_n, n_feat)]
+        top_names = [names_trimmed[i] for i in top_idx]
+
+        mat = np.abs(interaction_values[:, top_idx, :][:, :, top_idx]).mean(axis=0)
+
+        fig = go.Figure(go.Heatmap(
+            z=mat,
+            x=top_names,
+            y=top_names,
+            colorscale="Blues",
+            colorbar=dict(title="Mean |interaction|", thickness=14),
+            hovertemplate="<b>%{y} × %{x}</b><br>Mean |interaction|: %{z:.4f}<extra></extra>",
+        ))
+        fig.update_layout(
+            title=f"SHAP Interaction Values — top {len(top_names)} features "
+                  f"(n={X_proc.shape[0]:,})",
+            xaxis=dict(tickangle=-35, fixedrange=False),
+            yaxis=dict(autorange="reversed", fixedrange=False),
+            template="simple_white",
+            height=max(450, 35 * len(top_names)),
+        )
+        path = PLOT_OUTPUT_DIR / "shap_interactions.html"
+        fig.write_html(str(path), include_plotlyjs="cdn")
+        log.info("  SHAP interactions → %s", path)
+
+    except Exception as e:
+        log.warning("  SHAP interaction values failed (skipping): %s", e)
+
+
+def plot_calibration_curve(
+    pipeline: Pipeline,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    task: str,
+    *,
+    n_bins: int = 10,
+) -> None:
+    """Reliability diagram: calibrated vs uncalibrated predicted probabilities.
+
+    Only runs for binary classification. Skipped silently for regression
+    or multi-class tasks.
+    """
+    if task != "classification":
+        return
+
+    y_arr = np.asarray(y_val)
+    if len(np.unique(y_arr)) != 2:
+        log.info("  Calibration curve skipped (multi-class).")
+        return
+
+    log.info("  Plotting calibration curve...")
+    try:
+        from sklearn.calibration import calibration_curve
+
+        model_step = pipeline.named_steps["model"]
+        prep = pipeline.named_steps["preprocessor"]
+        X_proc = prep.transform(X_val)
+
+        traces = []
+
+        # ── Calibrated (final pipeline model) ────────────────────────────────
+        y_prob_cal = model_step.predict_proba(X_proc)[:, 1]
+        frac_pos_cal, mean_pred_cal = calibration_curve(y_arr, y_prob_cal, n_bins=n_bins)
+        traces.append(go.Scatter(
+            x=mean_pred_cal, y=frac_pos_cal, mode="lines+markers",
+            name="Calibrated", line=dict(color="#44AA77", width=2),
+            marker=dict(size=7),
+        ))
+
+        # ── Uncalibrated: reach inside CalibratedClassifierCV if present ─────
+        raw_xgb = None
+        if hasattr(model_step, "calibrated_classifiers_"):
+            raw_xgb = model_step.calibrated_classifiers_[0].estimator
+        elif hasattr(model_step, "estimator"):
+            raw_xgb = model_step.estimator
+
+        if raw_xgb is not None and hasattr(raw_xgb, "predict_proba"):
+            y_prob_raw = raw_xgb.predict_proba(X_proc)[:, 1]
+            frac_pos_raw, mean_pred_raw = calibration_curve(y_arr, y_prob_raw, n_bins=n_bins)
+            traces.append(go.Scatter(
+                x=mean_pred_raw, y=frac_pos_raw, mode="lines+markers",
+                name="Uncalibrated (raw XGBoost)",
+                line=dict(color="#CC3333", width=2, dash="dot"),
+                marker=dict(size=7),
+            ))
+
+        # ── Perfect calibration reference line ────────────────────────────────
+        traces.append(go.Scatter(
+            x=[0, 1], y=[0, 1], mode="lines",
+            line=dict(color="gray", dash="dash", width=1),
+            name="Perfect calibration",
+        ))
+
+        fig = go.Figure(traces)
+        fig.update_layout(
+            title="Calibration Curve (Reliability Diagram)",
+            xaxis_title="Mean predicted probability",
+            yaxis_title="Fraction of positives",
+            xaxis=dict(range=[0, 1]),
+            yaxis=dict(range=[0, 1.05]),
+            template="simple_white",
+            legend=dict(x=0.02, y=0.98),
+        )
+        path = PLOT_OUTPUT_DIR / "calibration_curve.html"
+        fig.write_html(str(path), include_plotlyjs="cdn")
+        log.info("  Calibration curve → %s", path)
+
+    except Exception as e:
+        log.warning("  Calibration curve failed (skipping): %s", e)
+
+
+def plot_correlation_heatmap(
+    X_train: pd.DataFrame,
+    num_cols: list[str],
+    *,
+    max_features: int = 40,
+) -> None:
+    """Pearson correlation heatmap for numerical features.
+
+    Capped at max_features to keep the plot readable; selects features
+    with the highest mean absolute correlation with all other features.
+    """
+    cols = [c for c in num_cols if c in X_train.columns]
+    if len(cols) < 2:
+        log.info("  Correlation heatmap skipped (fewer than 2 numerical features).")
+        return
+
+    log.info("  Computing correlation heatmap (%d numerical features)...", len(cols))
+    try:
+        corr = X_train[cols].corr(method="pearson")
+
+        # If more features than max_features, keep the most inter-correlated ones
+        if len(cols) > max_features:
+            mean_abs_corr = corr.abs().mean(axis=1)
+            top_cols = mean_abs_corr.nlargest(max_features).index.tolist()
+            corr = corr.loc[top_cols, top_cols]
+            log.info("    Heatmap trimmed to top-%d most correlated features.", max_features)
+
+        labels = corr.columns.tolist()
+        z = corr.values
+
+        # Mask upper triangle so we don't double-display (set to None)
+        z_display = z.copy().astype(object)
+        for i in range(len(labels)):
+            for j in range(i + 1, len(labels)):
+                z_display[i, j] = None
+
+        fig = go.Figure(go.Heatmap(
+            z=z_display,
+            x=labels,
+            y=labels,
+            colorscale="RdBu_r",
+            zmid=0,
+            zmin=-1, zmax=1,
+            colorbar=dict(title="Pearson r", thickness=14),
+            hovertemplate="<b>%{y} × %{x}</b><br>r = %{z:.3f}<extra></extra>",
+            text=np.where(z_display == None, "", np.round(z_display.astype(float), 2)),  # noqa: E711
+            texttemplate="%{text}",
+            textfont=dict(size=9),
+        ))
+        fig.update_layout(
+            title=f"Feature Correlation Matrix ({len(labels)} numerical features)",
+            xaxis=dict(tickangle=-40, fixedrange=False),
+            yaxis=dict(autorange="reversed", fixedrange=False),
+            template="simple_white",
+            height=max(450, 28 * len(labels)),
+            width=max(500, 30 * len(labels)),
+        )
+        path = PLOT_OUTPUT_DIR / "corr_heatmap.html"
+        fig.write_html(str(path), include_plotlyjs="cdn")
+        log.info("  Correlation heatmap → %s", path)
+
+    except Exception as e:
+        log.warning("  Correlation heatmap failed (skipping): %s", e)

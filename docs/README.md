@@ -1061,6 +1061,8 @@ Soft fallback: if `use_gpu: true` but no GPU is detected, training falls back to
 
 **MLflow has no startup warning.** When `MLFLOW_URI` is set but MLflow initialization fails, tracking is silently skipped. A warning on startup would be safer.
 
+**SHAP requires version ≥ 0.50.0 for XGBoost ≥ 3.0.0.** XGBoost 3.x serializes base_score as a JSON list rather than a plain float. SHAP < 0.50.0 fails to parse this and raises could not convert string to float: '[4.9973604E-1]'. The pyproject.toml pins shap>=0.50.0 to prevent this silently breaking on fresh installs
+
 ---
 
 ## Development Notes
