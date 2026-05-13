@@ -40,6 +40,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
@@ -243,7 +244,9 @@ def main() -> None:
     log.info("  Run ID: %s_%s", timestamp, run_id)
 
     # UPGRADE 26: lock environment immediately so the file is always written
-    lock_path = write_requirements_lock(run_id, MODEL_OUTPUT_DIR)
+    # Fire-and-forget into a thread so pip freeze doesn't stall the critical path.
+    _lock_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lock")
+    _lock_future   = _lock_executor.submit(write_requirements_lock, run_id, MODEL_OUTPUT_DIR)
 
     with _MLflowRun(run_id, timestamp, MLFLOW_URI, MLFLOW_EXPERIMENT) as mlrun:
 
@@ -392,11 +395,11 @@ def main() -> None:
                 n_estimators=best_n, early_stop=0, use_pca=use_pca,
             )
             preprocessor  = refit_pipeline.named_steps["preprocessor"]
-            X_tv_proc     = preprocessor.fit_transform(X_trainval.astype(np.float32), y_trainval.astype(float))
-            X_val_proc    = preprocessor.transform(X_val.astype(np.float32))
-            X_test_proc   = preprocessor.transform(X_test.astype(np.float32))
+            X_tv_proc     = preprocessor.fit_transform(X_trainval, y_trainval).astype(np.float32)
+            X_val_proc    = preprocessor.transform(X_val).astype(np.float32)
+            X_test_proc   = preprocessor.transform(X_test).astype(np.float32)
             _refit_cb     = _IterationLogCallback(period=CB_LOG_PERIOD, label="final")
-            refit_pipeline.named_steps["model"].set_params(nthread=-1, callbacks=[_refit_cb])
+            refit_pipeline.named_steps["model"].set_params(callbacks=[_refit_cb])
             refit_pipeline.named_steps["model"].fit(
                 X_tv_proc, y_trainval,
                 eval_set=[(X_val_proc, y_val)],
@@ -409,12 +412,12 @@ def main() -> None:
                 n_estimators=N_ESTIMATORS_MAX, early_stop=30, use_pca=use_pca,
             )
             preprocessor  = final_pipeline.named_steps["preprocessor"]
-            X_tv_proc     = preprocessor.fit_transform(X_trainval.astype(np.float32), y_trainval.astype(float))
-            X_val_proc    = preprocessor.transform(X_val.astype(np.float32))
-            X_test_proc   = preprocessor.transform(X_test.astype(np.float32))
+            X_tv_proc     = preprocessor.fit_transform(X_trainval, y_trainval).astype(np.float32)
+            X_val_proc    = preprocessor.transform(X_val).astype(np.float32)
+            X_test_proc   = preprocessor.transform(X_test).astype(np.float32)
 
             _es_model = final_pipeline.named_steps["model"]
-            _es_model.set_params(nthread=-1, callbacks=[_IterationLogCallback(period=CB_LOG_PERIOD, label="es-fit")])
+            _es_model.set_params(callbacks=[_IterationLogCallback(period=CB_LOG_PERIOD, label="es-fit")])
             _es_model.fit(
                 X_tv_proc, y_trainval,
                 eval_set=[(X_val_proc, y_val)],
@@ -432,7 +435,7 @@ def main() -> None:
             refit_pipeline.steps[step_names.index("preprocessor")] = ("preprocessor", preprocessor)
             _refit_cb    = _IterationLogCallback(period=CB_LOG_PERIOD, label="refit")
             _refit_model = refit_pipeline.named_steps["model"]
-            _refit_model.set_params(nthread=-1, callbacks=[_refit_cb])
+            _refit_model.set_params(callbacks=[_refit_cb])
             _refit_model.fit(X_tv_proc, y_trainval, verbose=False)
             cb_history = _refit_cb.history
         final_pipeline = refit_pipeline
@@ -474,7 +477,39 @@ def main() -> None:
         )
         log.info("")
 
-        uncertainty_report = estimate_uncertainty(
+        # ── Ensemble + error analysis + uncertainty — all independent after final fit ─
+        # Submit all three concurrently; resolve them after plots finish.
+        _post_fit_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="post_fit")
+
+        ensemble_path: Path | None = None
+        ensemble_summary: dict = {
+            "enabled": ENSEMBLE_ENABLED, "status": "disabled",
+            "top_k_requested": ENSEMBLE_TOP_K,
+        }
+        if ENSEMBLE_ENABLED:
+            _ens_future = _post_fit_pool.submit(
+                build_top_k_ensemble,
+                study=study,
+                X_trainval=X_trainval, y_trainval=y_trainval,
+                X_test=X_test, y_test=y_test,
+                num_cols=num_cols, ohe_cat_cols=ohe_cat_cols, te_cat_cols=te_cat_cols,
+                task=TASK, metric=metric, use_pca=use_pca,
+                top_k=ENSEMBLE_TOP_K, n_estimators=best_n,
+                threshold=best_threshold, log_transformed=log_transformed,
+            )
+        else:
+            _ens_future = None
+            log.info("[ensemble] [skipped]")
+
+        # ── N5: error analysis  (runs concurrently with ensemble + uncertainty) ──
+        _err_future = _post_fit_pool.submit(
+            analyse_errors,
+            final_pipeline, X_test, y_test, metric, best_threshold, run_id,
+            X_test_proc=X_test_proc, label_encoder=le,
+        )
+
+        _unc_future = _post_fit_pool.submit(
+            estimate_uncertainty,
             final_pipeline,
             X_trainval, y_trainval,
             X_val, y_val,
@@ -488,22 +523,96 @@ def main() -> None:
             enabled=UNCERTAINTY_ENABLED,
         )
 
-        # ── Ensemble ─────────────────────────────────────────────────────────
-        ensemble_path: Path | None = None
-        ensemble_summary: dict = {
-            "enabled": ENSEMBLE_ENABLED, "status": "disabled",
-            "top_k_requested": ENSEMBLE_TOP_K,
-        }
-        if ENSEMBLE_ENABLED:
-            ensemble_model, ensemble_summary = build_top_k_ensemble(
-                study=study,
-                X_trainval=X_trainval, y_trainval=y_trainval,
-                X_test=X_test, y_test=y_test,
-                num_cols=num_cols, ohe_cat_cols=ohe_cat_cols, te_cat_cols=te_cat_cols,
-                task=TASK, metric=metric, use_pca=use_pca,
-                top_k=ENSEMBLE_TOP_K, n_estimators=best_n,
-                threshold=best_threshold, log_transformed=log_transformed,
-            )
+        # ── 8. Plots (parallel) ───────────────────────────────────────────────
+        if PLOTS_ENABLED:
+            _plot_tasks: list = []
+            _plot_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="plot")
+
+            _plot_tasks.append(_plot_pool.submit(
+                plot_feature_importance,
+                final_pipeline, num_cols, ohe_cat_cols, te_cat_cols, use_pca,
+            ))
+            if PERM_IMPORTANCE_ENABLED:
+                _plot_tasks.append(_plot_pool.submit(
+                    plot_permutation_importance,
+                    final_pipeline, X_test, y_test,
+                    num_cols, ohe_cat_cols, te_cat_cols,
+                    metric, TASK, X_test_proc=X_test_proc,
+                ))
+            else:
+                log.info("[perm_importance] [skipped]")
+            if THRESHOLD_SWEEP_ENABLED:
+                _plot_tasks.append(_plot_pool.submit(
+                    plot_threshold_sweep,
+                    final_pipeline, X_val, y_val, metric, X_val_proc=X_val_proc,
+                ))
+            else:
+                log.info("[threshold_sweep] [skipped]")
+            if OUTLIER_REPORT_ENABLED:
+                _plot_tasks.append(_plot_pool.submit(
+                    plot_outlier_report,
+                    final_pipeline, X_train, X_test, y_test, num_cols, use_pca,
+                ))
+            else:
+                log.info("[outlier_report] [skipped]")
+            if PDP_ENABLED:
+                _plot_tasks.append(_plot_pool.submit(
+                    plot_partial_dependence,
+                    final_pipeline, X_train, y_train,
+                    num_cols, ohe_cat_cols, te_cat_cols, use_pca, TASK,
+                ))
+            else:
+                log.info("[partial_dependence] [skipped]")
+            if PCA_PLOTS_ENABLED and use_pca:
+                _plot_tasks.append(_plot_pool.submit(
+                    plot_pca_diagnostics, final_pipeline, X_train, y_train, TASK,
+                ))
+            elif PCA_PLOTS_ENABLED:
+                log.info("[pca_plots] [skipped] — PCA not active")
+            else:
+                log.info("[pca_plots] [skipped]")
+            if SHAP_ENABLED:
+                _plot_tasks.append(_plot_pool.submit(
+                    plot_shap_summary,
+                    final_pipeline, X_test,
+                    num_cols, ohe_cat_cols, te_cat_cols, use_pca, TASK,
+                ))
+                _plot_tasks.append(_plot_pool.submit(
+                    plot_shap_interactions,
+                    final_pipeline, X_test,
+                    num_cols, ohe_cat_cols, te_cat_cols, use_pca,
+                ))
+            else:
+                log.info("[shap] [skipped]")
+            if CALIBRATION_CURVE_ENABLED:
+                _plot_tasks.append(_plot_pool.submit(
+                    plot_calibration_curve, final_pipeline, X_val, y_val, TASK,
+                ))
+            else:
+                log.info("[calibration_curve] [skipped]")
+            if CORR_HEATMAP_ENABLED:
+                _plot_tasks.append(_plot_pool.submit(
+                    plot_correlation_heatmap, X_train, num_cols,
+                ))
+            else:
+                log.info("[corr_heatmap] [skipped]")
+
+            # Drain plot futures; surface any exceptions without aborting the run.
+            for _f in as_completed(_plot_tasks):
+                try:
+                    _f.result()
+                except Exception as _exc:
+                    log.warning("[plots] A plot task failed: %s", _exc)
+            _plot_pool.shutdown(wait=False)
+        else:
+            log.info("[8/9] Plots [skipped]")
+
+        # ── Resolve post-fit futures (error analysis, uncertainty, ensemble) ──
+        error_csv       = _err_future.result()
+        uncertainty_report = _unc_future.result()
+
+        if _ens_future is not None:
+            ensemble_model, ensemble_summary = _ens_future.result()
             if ensemble_model is not None:
                 ensemble_path = MODEL_OUTPUT_DIR / f"ensemble_{timestamp}_{run_id}.joblib"
                 joblib.dump(
@@ -516,74 +625,8 @@ def main() -> None:
                     ensemble_path,
                 )
                 log.info("  Top-K ensemble saved → %s", ensemble_path)
-        else:
-            log.info("[ensemble] [skipped]")
 
-        # ── N5: error analysis ────────────────────────────────────────────────
-        error_csv = analyse_errors(
-            final_pipeline, X_test, y_test, metric, best_threshold, run_id,
-            X_test_proc=X_test_proc, label_encoder=le,
-        )
-
-        # ── 8. Plots ─────────────────────────────────────────────────────────
-        if PLOTS_ENABLED:
-            plot_feature_importance(
-                final_pipeline, num_cols, ohe_cat_cols, te_cat_cols, use_pca
-            )
-            if PERM_IMPORTANCE_ENABLED:
-                plot_permutation_importance(
-                    final_pipeline, X_test, y_test,
-                    num_cols, ohe_cat_cols, te_cat_cols,
-                    metric, TASK, X_test_proc=X_test_proc,
-                )
-            else:
-                log.info("[perm_importance] [skipped]")
-            if THRESHOLD_SWEEP_ENABLED:
-                plot_threshold_sweep(
-                    final_pipeline, X_val, y_val, metric, X_val_proc=X_val_proc
-                )
-            else:
-                log.info("[threshold_sweep] [skipped]")
-            if OUTLIER_REPORT_ENABLED:
-                plot_outlier_report(
-                    final_pipeline, X_train, X_test, y_test, num_cols, use_pca
-                )
-            else:
-                log.info("[outlier_report] [skipped]")
-            if PDP_ENABLED:
-                plot_partial_dependence(
-                    final_pipeline, X_train, y_train,
-                    num_cols, ohe_cat_cols, te_cat_cols, use_pca, TASK,
-                )
-            else:
-                log.info("[partial_dependence] [skipped]")
-            if PCA_PLOTS_ENABLED and use_pca:
-                plot_pca_diagnostics(final_pipeline, X_train, y_train, TASK)
-            elif PCA_PLOTS_ENABLED and not use_pca:
-                log.info("[pca_plots] [skipped] — PCA not active")
-            else:
-                log.info("[pca_plots] [skipped]")
-            if SHAP_ENABLED:
-                plot_shap_summary(
-                    final_pipeline, X_test,
-                    num_cols, ohe_cat_cols, te_cat_cols, use_pca, TASK,
-                )
-                plot_shap_interactions(
-                    final_pipeline, X_test,
-                    num_cols, ohe_cat_cols, te_cat_cols, use_pca,
-                )
-            else:
-                log.info("[shap] [skipped]")
-            if CALIBRATION_CURVE_ENABLED:
-                plot_calibration_curve(final_pipeline, X_val, y_val, TASK)
-            else:
-                log.info("[calibration_curve] [skipped]")
-            if CORR_HEATMAP_ENABLED:
-                plot_correlation_heatmap(X_train, num_cols)
-            else:
-                log.info("[corr_heatmap] [skipped]")
-        else:
-            log.info("[8/9] Plots [skipped]")
+        _post_fit_pool.shutdown(wait=False)
 
         # ── Drift monitor reference ───────────────────────────────────────────
         known_categories: dict[str, set] = {
@@ -636,6 +679,9 @@ def main() -> None:
             log.info("[drift_monitor] [skipped]")
 
         # ── 9. Save artifact ─────────────────────────────────────────────────
+        # Resolve the requirements lock now — it's had the entire run to finish.
+        lock_path = _lock_future.result()
+        _lock_executor.shutdown(wait=False)
         config_snapshot = dict(
             task=TASK, target_col=TARGET_COL, test_size=TEST_SIZE,
             random_state=RANDOM_STATE, cv_folds=CV_FOLDS, cv_strategy=CV_STRATEGY,

@@ -516,12 +516,10 @@ def tune_hyperparameters(
     log.info("  Pre-fitting preprocessor on X_train (once, parallel ColumnTransformer)...")
     _prep_pipe = build_pipeline(num_cols, ohe_cat_cols, te_cat_cols, task, metric, use_pca=use_pca)
     preprocessor = _prep_pipe.named_steps["preprocessor"]
-    y_train_arr = np.array(y_train)
-    y_val_arr   = np.array(y_val)
-    X_train_f32 = X_train.astype(np.float32)
-    X_val_f32   = X_val.astype(np.float32)
-    X_train_proc = _as_xgb_matrix(preprocessor.fit_transform(X_train_f32, y_train_arr.astype(float)))
-    X_val_proc   = _as_xgb_matrix(preprocessor.transform(X_val_f32))
+    y_train_arr  = np.array(y_train)
+    y_val_arr    = np.array(y_val)
+    X_train_proc = _as_xgb_matrix(preprocessor.fit_transform(X_train, y_train_arr))
+    X_val_proc   = _as_xgb_matrix(preprocessor.transform(X_val))
 
     n_rows = len(X_train_proc)
 
