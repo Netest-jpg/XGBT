@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import numpy as np
-from sklearn.metrics import f1_score, fbeta_score, precision_score, recall_score
+
 
 
 @dataclass
@@ -62,6 +62,59 @@ def _candidate_thresholds(y_proba: np.ndarray, n_quantiles: int) -> np.ndarray:
     return candidates[(candidates >= 0) & (candidates <= 1)]
 
 
+def _vectorized_scores(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    candidates: np.ndarray,
+    beta: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute precision/recall/f1/fbeta/support for all thresholds in one pass.
+
+    Broadcasting shape: (n_candidates, n_samples) avoids any Python loop over
+    thresholds and replaces ~200 individual sklearn calls with pure NumPy ops.
+    Returns five 1-D arrays indexed by candidate position.
+    """
+    # preds[i, j] = True iff y_proba[j] >= candidates[i]
+    preds = y_proba[np.newaxis, :] >= candidates[:, np.newaxis]  # (C, N)
+
+    pos = y_true.astype(bool)
+    tp = preds[:, pos].sum(axis=1).astype(float)    # (C,)
+    fp = preds[:, ~pos].sum(axis=1).astype(float)   # (C,)
+    fn = (~preds[:, pos]).sum(axis=1).astype(float)  # (C,)
+
+    precision = np.where(tp + fp > 0, tp / (tp + fp), 0.0)
+    recall    = np.where(tp + fn > 0, tp / (tp + fn), 0.0)
+
+    denom_f1 = precision + recall
+    f1       = np.where(denom_f1 > 0, 2 * precision * recall / denom_f1, 0.0)
+
+    denom_fb = beta ** 2 * precision + recall
+    fbeta    = np.where(denom_fb > 0, (1 + beta ** 2) * precision * recall / denom_fb, 0.0)
+
+    support = preds.sum(axis=1).astype(float)
+    return precision, recall, f1, fbeta, support
+
+
+def _metrics_dict(
+    precision: np.ndarray,
+    recall: np.ndarray,
+    f1: np.ndarray,
+    fbeta: np.ndarray,
+    support: np.ndarray,
+    idx: int,
+    objective_key: str,
+) -> dict[str, float]:
+    m = {
+        "precision": float(precision[idx]),
+        "recall":    float(recall[idx]),
+        "f1":        float(f1[idx]),
+        "fbeta":     float(fbeta[idx]),
+        "support":   float(support[idx]),
+    }
+    m["objective"] = m[objective_key]
+    return m
+
+
 def tune_binary_threshold(
     y_true: np.ndarray,
     y_proba: np.ndarray,
@@ -71,50 +124,55 @@ def tune_binary_threshold(
     """Tune a binary decision threshold using a named, generic policy."""
     normalized = normalize_policy(policy, metric_name=metric_name)
     mode = normalized["mode"]
+    beta = normalized["beta"]
     y_true = np.asarray(y_true).astype(int)
     y_proba = np.asarray(y_proba, dtype=float)
 
-    def score_at(threshold: float) -> dict[str, float]:
-        pred = (y_proba >= threshold).astype(int)
-        return {
-            "precision": float(precision_score(y_true, pred, zero_division=0)),
-            "recall": float(recall_score(y_true, pred, zero_division=0)),
-            "f1": float(f1_score(y_true, pred, zero_division=0)),
-            "fbeta": float(fbeta_score(y_true, pred, beta=normalized["beta"], zero_division=0)),
-            "support": float(pred.sum()),
-        }
-
     if mode == "disabled":
-        metrics = score_at(0.5)
-        metrics["objective"] = metrics["f1"]
+        # Single-threshold fast path — no vectorization needed.
+        pred = (y_proba >= 0.5).astype(bool)
+        pos = y_true.astype(bool)
+        tp = float(pred[pos].sum());  fp = float(pred[~pos].sum());  fn = float((~pred)[pos].sum())
+        prec = tp / (tp + fp) if tp + fp else 0.0
+        rec  = tp / (tp + fn) if tp + fn else 0.0
+        d_f1 = prec + rec
+        f1v  = 2 * prec * rec / d_f1 if d_f1 else 0.0
+        metrics = {"precision": prec, "recall": rec, "f1": f1v,
+                   "fbeta": f1v, "support": float(pred.sum()), "objective": f1v}
         return ThresholdResult(0.5, normalized, metrics)
 
     candidates = _candidate_thresholds(y_proba, normalized["n_quantiles"])
-    rows = [(float(th), score_at(float(th))) for th in candidates]
+    precision, recall, f1, fbeta, support = _vectorized_scores(y_true, y_proba, candidates, beta)
 
     if mode == "f1":
-        best_th, best_metrics = max(rows, key=lambda item: (item[1]["f1"], item[0]))
-        best_metrics["objective"] = best_metrics["f1"]
+        # np.lexsort sorts ascending; last key is primary. Tie-break: prefer higher threshold.
+        idx = int(np.lexsort((candidates, f1))[-1])
+        obj_key = "f1"
     elif mode == "fbeta":
-        best_th, best_metrics = max(rows, key=lambda item: (item[1]["fbeta"], item[0]))
-        best_metrics["objective"] = best_metrics["fbeta"]
+        idx = int(np.lexsort((candidates, fbeta))[-1])
+        obj_key = "fbeta"
     elif mode == "precision_at_recall":
-        feasible = [row for row in rows if row[1]["recall"] >= normalized["min_recall"]]
-        if not feasible:
-            feasible = rows
-        best_th, best_metrics = max(feasible, key=lambda item: (item[1]["precision"], item[1]["recall"], item[0]))
-        best_metrics["objective"] = best_metrics["precision"]
+        mask = recall >= normalized["min_recall"]
+        if not mask.any():
+            mask = np.ones(len(candidates), dtype=bool)
+        fi = np.where(mask)[0]
+        idx = int(fi[np.lexsort((candidates[fi], recall[fi], precision[fi]))[-1]])
+        obj_key = "precision"
     elif mode == "recall_at_precision":
-        feasible = [row for row in rows if row[1]["precision"] >= normalized["min_precision"]]
-        if not feasible:
-            feasible = rows
-        best_th, best_metrics = max(feasible, key=lambda item: (item[1]["recall"], item[1]["precision"], item[0]))
-        best_metrics["objective"] = best_metrics["recall"]
+        mask = precision >= normalized["min_precision"]
+        if not mask.any():
+            mask = np.ones(len(candidates), dtype=bool)
+        fi = np.where(mask)[0]
+        idx = int(fi[np.lexsort((candidates[fi], precision[fi], recall[fi]))[-1]])
+        obj_key = "recall"
     else:
         raise ValueError(
             "threshold_policy.mode must be one of "
             "'auto', 'f1', 'fbeta', 'precision_at_recall', 'recall_at_precision', or 'disabled'"
         )
 
-    return ThresholdResult(float(best_th), normalized, best_metrics)
-
+    return ThresholdResult(
+        float(candidates[idx]),
+        normalized,
+        _metrics_dict(precision, recall, f1, fbeta, support, idx, obj_key),
+    )
