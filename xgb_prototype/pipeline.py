@@ -755,6 +755,8 @@ def tune_hyperparameters(
             **fit_kwargs,
         )
         best_iteration = int(getattr(booster, "best_iteration", trial_n_estimators - 1) or 0)
+        # +1: best_iteration is 0-based round index; n_estimators is a count.
+        trial.set_user_attr("best_n_estimators", best_iteration + 1)
         score = _score_booster(booster, _dval_search, y_val_arr, task, metric)
         trial.report(score, step=best_iteration)
         if trial.should_prune():
@@ -851,6 +853,31 @@ def tune_hyperparameters(
 
 # ── Top-K ensemble (UPGRADE 11) ───────────────────────────────────────────────
 
+from joblib import Parallel, delayed
+
+
+def _fit_one(name: str, est, X, y):
+    """Fit a single pipeline — runs in a worker process."""
+    est.fit(X, y)
+    return name, est
+
+
+class _IdentityLabelEncoder:
+    """Picklable stand-in for sklearn's LabelEncoder inside VotingClassifier.
+
+    VotingClassifier.predict/predict_proba use ``self.le_.transform`` to map
+    integer class indices back to original labels.  When the targets are
+    already 0-based integers we can skip the real LabelEncoder and use this
+    lightweight, fully-picklable replacement instead.
+    """
+
+    def __init__(self, classes: np.ndarray) -> None:
+        self.classes_ = classes
+
+    def transform(self, y):
+        return np.asarray(y)
+
+
 def build_top_k_ensemble(
     study: optuna.Study | None,
     X_trainval: pd.DataFrame,
@@ -876,11 +903,15 @@ def build_top_k_ensemble(
             "reason": "Optuna study unavailable for current search backend",
             "top_k_requested": top_k, "trials_used": 0,
         }
+
     complete_trials = [
         t for t in study.trials
         if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
     ]
-    complete_trials.sort(key=lambda t: float(t.value), reverse=(metric.direction == "maximize"))
+    complete_trials.sort(
+        key=lambda t: float(t.value),
+        reverse=(metric.direction == "maximize"),
+    )
     selected = complete_trials[:top_k]
 
     if len(selected) < 2:
@@ -891,51 +922,97 @@ def build_top_k_ensemble(
             "top_k_requested": top_k, "trials_used": len(selected),
         }
 
-    estimators = []
+    # Build unfitted pipelines — n_estimators resolved per member:
+    #   1. early-stop path (TUNE_N_ESTIMATORS=False): use best_n_estimators stored
+    #      in user_attrs by the objective (best_iteration + 1).
+    #   2. tuned path (TUNE_N_ESTIMATORS=True): n_estimators lives in trial.params.
+    #   3. fallback: global n_estimators argument.
+    named_estimators = []
     trial_rows = []
+    n_est_global = max(1, int(n_estimators))
     for idx, trial in enumerate(selected, 1):
-        est = build_pipeline(num_cols, ohe_cat_cols, te_cat_cols, task, metric,
-                             params=trial.params, n_estimators=max(1, int(n_estimators)),
-                             early_stop=0, use_pca=use_pca)
-        estimators.append((f"trial_{trial.number}", est))
-        trial_rows.append({"rank": idx, "trial_number": trial.number,
-                           "value": float(trial.value), "params": dict(trial.params)})
+        n_est_member = int(
+            trial.user_attrs.get("best_n_estimators", None)
+            or trial.params.get("n_estimators", None)
+            or n_est_global
+        )
+        n_est_member = max(1, n_est_member)
+        est = build_pipeline(
+            num_cols, ohe_cat_cols, te_cat_cols, task, metric,
+            params=trial.params, n_estimators=n_est_member,
+            early_stop=0, use_pca=use_pca,
+        )
+        named_estimators.append((f"trial_{trial.number}", est))
+        trial_rows.append({
+            "rank": idx,
+            "trial_number": trial.number,
+            "value": float(trial.value),
+            "n_estimators": n_est_member,
+            "params": dict(trial.params),
+        })
 
-    ensemble: Any = (
-        VotingClassifier(estimators=estimators, voting="soft", n_jobs=-1)
-        if task == "classification"
-        else VotingRegressor(estimators=estimators, n_jobs=-1)
+    # ── Parallel fit ──────────────────────────────────────────────────────────
+    # Each member is independent — no need to fit them sequentially.
+    # n_jobs=-1 uses all cores; prefer="threads" avoids pickling overhead when
+    # pipelines contain objects that serialise poorly (swap to "processes" if
+    # your estimators release the GIL and serialise cleanly).
+    log.info("[ensemble] Fitting %d members in parallel...", len(named_estimators))
+    fitted_pairs = Parallel(n_jobs=-1, prefer="threads")(
+        delayed(_fit_one)(name, est, X_trainval, y_trainval)
+        for name, est in named_estimators
     )
-    log.info("[ensemble] Fitting top-%d soft-voting ensemble...", top_k)
-    ensemble.fit(X_trainval, y_trainval)
+    fitted_estimators = [(name, est) for name, est in fitted_pairs]
+
+    # Wrap in a voting ensemble — pass pre_fit=True to skip internal refit
+    # (sklearn ≥ 1.4 honours already-fitted estimators automatically)
+    ensemble: Any = (
+        VotingClassifier(estimators=fitted_estimators, voting="soft", n_jobs=-1)
+        if task == "classification"
+        else VotingRegressor(estimators=fitted_estimators, n_jobs=-1)
+    )
+    # Mark as fitted so sklearn won't refit internally on predict calls
+    ensemble.estimators_ = [est for _, est in fitted_estimators]
+    ensemble.named_estimators_ = dict(fitted_estimators)
+    if task == "classification":
+        # VotingClassifier also needs these attributes
+        classes = np.unique(y_trainval)
+        ensemble.le_      = _IdentityLabelEncoder(classes)
+        ensemble.classes_ = classes
+
+    # ── Evaluation ────────────────────────────────────────────────────────────
+    y_test_arr = np.asarray(y_test)   # cast once
 
     if task == "classification":
         if metric.needs_proba:
-            y_proba = ensemble.predict_proba(X_test)[:, 1]
-            y_pred  = (y_proba >= threshold).astype(int)
+            y_proba     = ensemble.predict_proba(X_test)[:, 1]
+            y_pred      = (y_proba >= threshold).astype(int)
             eval_metrics = {
-                "selected_metric": float(metric.score(np.array(y_test), y_pred, y_proba)),
-                "auprc":           float(average_precision_score(y_test, y_proba)),
-                "roc_auc":         float(roc_auc_score(y_test, y_proba)),
+                "selected_metric": float(metric.score(y_test_arr, y_pred, y_proba)),
+                "auprc":           float(average_precision_score(y_test_arr, y_proba)),
+                "roc_auc":         float(roc_auc_score(y_test_arr, y_proba)),
                 "threshold":       float(threshold),
             }
         else:
             y_pred = ensemble.predict(X_test)
-            eval_metrics = {"selected_metric": float(metric.score(np.array(y_test), y_pred, None)),
-                            "threshold": None}
+            eval_metrics = {
+                "selected_metric": float(metric.score(y_test_arr, y_pred, None)),
+                "threshold": None,
+            }
     else:
-        y_pred      = ensemble.predict(X_test)
-        y_test_eval = np.expm1(np.array(y_test)) if log_transformed else np.array(y_test)
-        y_pred_eval = np.expm1(y_pred) if log_transformed else y_pred
+        y_pred = ensemble.predict(X_test)
+        if log_transformed:
+            y_test_arr = np.expm1(y_test_arr)
+            y_pred     = np.expm1(y_pred)
         eval_metrics = {
-            "rmse": float(np.sqrt(mean_squared_error(y_test_eval, y_pred_eval))),
-            "mae":  float(mean_absolute_error(y_test_eval, y_pred_eval)),
-            "r2":   float(r2_score(y_test_eval, y_pred_eval)),
+            "rmse": float(np.sqrt(mean_squared_error(y_test_arr, y_pred))),
+            "mae":  float(mean_absolute_error(y_test_arr, y_pred)),
+            "r2":   float(r2_score(y_test_arr, y_pred)),
         }
 
     return ensemble, {
         "enabled": True, "status": "fitted",
-        "top_k_requested": top_k, "trials_used": len(estimators),
-        "n_estimators_per_member": int(n_estimators),
-        "member_trials": trial_rows, "eval_metrics": eval_metrics,
+        "top_k_requested": top_k, "trials_used": len(fitted_estimators),
+        "n_estimators_global_fallback": n_est_global,
+        "member_trials": trial_rows,
+        "eval_metrics": eval_metrics,
     }
