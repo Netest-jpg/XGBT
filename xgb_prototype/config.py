@@ -153,6 +153,27 @@ class TrainingConfig:
 
 
 def _section(cls, data: dict[str, Any], key: str):
+    """
+    Extract a nested config section from a raw dictionary and instantiate it as
+    a dataclass, handling three YAML edge cases:
+      - Key absent from file   → defaults to {}.
+      - Key explicitly null    → treated as {}.
+      - Key is not a mapping   → raises TypeError.
+
+    Unknown keys from the YAML are silently ignored, keeping older or richer
+    config files compatible with a narrower dataclass definition.
+
+    Args:
+        cls:  A dataclass type whose __dataclass_fields__ defines accepted keys.
+        data: The top-level config dictionary (already deserialised from YAML).
+        key:  The string key whose value should be used to populate `cls`.
+
+    Returns:
+        An instance of `cls` initialised from the matching sub-dict.
+
+    Raises:
+        TypeError: If the value at `data[key]` is not a dict (and not None).
+    """
     raw = data.get(key, {})
     if raw is None:
         raw = {}
@@ -162,9 +183,78 @@ def _section(cls, data: dict[str, Any], key: str):
 
 
 def load_config(path: str | Path = "config.yaml") -> TrainingConfig:
-    """Load a YAML config into dataclasses, tolerating older flat config files."""
+    """
+    Load a YAML config file into a nested TrainingConfig dataclass tree,
+    tolerating older flat config files that pre-date the nested layout.
+
+    Flow
+    ----
+
+    ::
+
+        ┌─────────────────────────────────┐
+        │  load_config(path)              │
+        └────────────┬────────────────────┘
+                     │
+                     ▼
+        ┌────────────────────────────┐
+        │ OmegaConf available?       │
+        │                            │
+        │  No ──► return             │
+        │         TrainingConfig()   │
+        │                            │
+        │  Yes ──► continue          │
+        └────────────┬───────────────┘
+                     │
+                     ▼
+        ┌────────────────────────────┐
+        │ cfg_path.exists()?         │
+        │                            │
+        │  No  ──► data = {}         │
+        │                            │
+        │  Yes ──► OmegaConf.load()  │
+        │          + to_container()  │
+        └────────────┬───────────────┘
+                     │
+                     ▼
+        ┌────────────────────────────┐
+        │ Validate root is a dict    │
+        │ (None → {}, non-dict →     │
+        │  TypeError)                │
+        └────────────┬───────────────┘
+                     │
+                     ▼
+        ┌────────────────────────────────────────────┐
+        │ Build nested section dataclasses via       │
+        │ _section() for each sub-config key         │
+        └────────────┬───────────────────────────────┘
+                     │
+                     ▼
+        ┌────────────────────────────────────────────┐
+        │ Collect remaining top-level scalar fields  │
+        │ (TrainingConfig fields minus nested keys)  │
+        └────────────┬───────────────────────────────┘
+                     │
+                     ▼
+        ┌────────────────────────────┐
+        │ Merge scalars + sections   │
+        │ ──► TrainingConfig(**kwargs)│
+        └────────────────────────────┘
+
+    Args:
+        path: Path to the YAML config file. Defaults to ``"config.yaml"`` in
+              the current working directory.
+
+    Returns:
+        A fully-populated :class:`TrainingConfig` instance. Any key absent
+        from the file falls back to the dataclass field's default value.
+
+    Raises:
+        TypeError: If the YAML root (or any expected section) is not a mapping.
+    """
     if OmegaConf is None:
         return TrainingConfig()
+
     cfg_path = Path(path)
     data = OmegaConf.to_container(OmegaConf.load(cfg_path), resolve=True) if cfg_path.exists() else {}
     if data is None:
@@ -173,15 +263,15 @@ def load_config(path: str | Path = "config.yaml") -> TrainingConfig:
         raise TypeError(f"config root must be a mapping, got {type(data).__name__}")
 
     nested = {
-        "threshold_policy": _section(ThresholdPolicyConfig, data, "threshold_policy"),
-        "baselines": _section(BaselineConfig, data, "baselines"),
-        "diagnostics": _section(DiagnosticsConfig, data, "diagnostics"),
-        "ensemble": _section(EnsembleConfig, data, "ensemble"),
+        "threshold_policy":         _section(ThresholdPolicyConfig,        data, "threshold_policy"),
+        "baselines":                _section(BaselineConfig,               data, "baselines"),
+        "diagnostics":              _section(DiagnosticsConfig,            data, "diagnostics"),
+        "ensemble":                 _section(EnsembleConfig,               data, "ensemble"),
         "auto_feature_engineering": _section(AutoFeatureEngineeringConfig, data, "auto_feature_engineering"),
-        "search": _section(SearchConfig, data, "search"),
-        "sobol_sensitivity": _section(SobolSensitivityConfig, data, "sobol_sensitivity"),
-        "uncertainty": _section(UncertaintyConfig, data, "uncertainty"),
-        "drift_monitor": _section(DriftMonitorConfig, data, "drift_monitor"),
+        "search":                   _section(SearchConfig,                 data, "search"),
+        "sobol_sensitivity":        _section(SobolSensitivityConfig,       data, "sobol_sensitivity"),
+        "uncertainty":              _section(UncertaintyConfig,            data, "uncertainty"),
+        "drift_monitor":            _section(DriftMonitorConfig,           data, "drift_monitor"),
     }
     top_level_fields = set(TrainingConfig.__dataclass_fields__) - set(nested)
     kwargs = {k: v for k, v in data.items() if k in top_level_fields}

@@ -231,7 +231,7 @@ def plot_pca_diagnostics(
     ax.spines[["top", "right"]].set_visible(False)
     plt.tight_layout()
     path2 = PLOT_OUTPUT_DIR / "pca_2d.png"
-    plt.savefig(str(path2), dpi=150, bbox_inches="tight"); plt.close()
+    plt.savefig(str(path2), dpi=100, bbox_inches="tight"); plt.close()
     log.info("  PCA 2-D → %s", path2)
 
     if n_keep >= 3:
@@ -338,6 +338,7 @@ def plot_permutation_importance(
 def plot_learning_curve(
     pipeline: Pipeline, X_trainval: pd.DataFrame,
     y_trainval: pd.Series, metric, task: str,
+    X_trainval_proc: np.ndarray | None = None,
 ) -> None:
     log.info("  Computing learning curve (cv=3, 8 sizes)...")
     scoring_map = {"roc_auc": "roc_auc", "auprc": "average_precision",
@@ -346,9 +347,20 @@ def plot_learning_curve(
     train_sizes_frac = np.logspace(np.log10(0.10), 0, num=8)
     cv_lc = (StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
              if task == "classification" else 3)
+
+    # If pre-processed data is provided, run learning_curve on just the model
+    # step to avoid re-running the preprocessor on every fold (same output,
+    # significantly faster).
+    if X_trainval_proc is not None:
+        estimator = pipeline.named_steps["model"]
+        X_lc = X_trainval_proc
+    else:
+        estimator = pipeline
+        X_lc = X_trainval
+
     try:
         train_sizes, train_scores, val_scores = learning_curve(
-            pipeline, X_trainval, y_trainval,
+            estimator, X_lc, y_trainval,
             train_sizes=train_sizes_frac, cv=cv_lc, scoring=scoring, n_jobs=-1, shuffle=False,
         )
     except Exception as e:
@@ -486,24 +498,41 @@ def plot_partial_dependence(
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    for fi, fname in zip(top_idx, top_names):
-        try:
-            fig_mpl, ax = plt.subplots(figsize=(7, 4))
-            PartialDependenceDisplay.from_estimator(
-                base_model, X_ice, features=[int(fi)], feature_names=feat_names,
-                kind="both", subsample=_MAX_ICE, random_state=RANDOM_STATE, ax=ax,
-                pd_line_kw={"color": "#CC3333", "linewidth": 2.5},
-                ice_lines_kw={"color": "#4477AA", "alpha": 0.06, "linewidth": 0.8},
-            )
+    # Compute all PDPs in one batched call. sklearn internally vectorises the
+    # grid evaluations across features, which is significantly faster than
+    # calling from_estimator once per feature in a Python loop.
+    try:
+        n_cols = min(3, len(top_idx))
+        n_rows = (len(top_idx) + n_cols - 1) // n_cols
+        fig_mpl, axes = plt.subplots(
+            n_rows, n_cols,
+            figsize=(7 * n_cols, 4 * n_rows),
+            squeeze=False,
+        )
+        PartialDependenceDisplay.from_estimator(
+            base_model, X_ice,
+            features=[int(fi) for fi in top_idx],
+            feature_names=feat_names,
+            kind="both",
+            subsample=_MAX_ICE,
+            random_state=RANDOM_STATE,
+            ax=axes.ravel()[:len(top_idx)],
+            pd_line_kw={"color": "#CC3333", "linewidth": 2.5},
+            ice_lines_kw={"color": "#4477AA", "alpha": 0.06, "linewidth": 0.8},
+        )
+        # Hide any unused axes in the grid
+        for ax in axes.ravel()[len(top_idx):]:
+            ax.set_visible(False)
+        for ax, fname in zip(axes.ravel(), top_names):
             ax.set_title(f"PDP + ICE — {fname}")
             ax.spines[["top", "right"]].set_visible(False)
-            plt.tight_layout()
-            safe = fname.replace(" ", "_").replace("/", "_")[:60]
-            path_png = PLOT_OUTPUT_DIR / f"pdp_{safe}.png"
-            plt.savefig(str(path_png), dpi=150, bbox_inches="tight"); plt.close()
-            log.info("    PDP → %s", path_png)
-        except Exception as e:
-            log.warning("    PDP failed for '%s': %s", fname, e)
+        plt.tight_layout()
+        path_png = PLOT_OUTPUT_DIR / "pdp_all.png"
+        plt.savefig(str(path_png), dpi=150, bbox_inches="tight")
+        plt.close()
+        log.info("  PDP (all features) → %s", path_png)
+    except Exception as e:
+        log.warning("  PDP batch call failed (skipping): %s", e)
 
 
 def _extract_booster_and_feature_names(
@@ -609,32 +638,46 @@ def plot_shap_summary(
         feat_range = np.where(feat_max - feat_min == 0, 1.0, feat_max - feat_min)
         feat_norm = (X_display - feat_min) / feat_range  # 0–1 per feature
 
+        # Build a single consolidated scatter trace using None separators between
+        # features. This is much faster than adding one trace per feature because
+        # Plotly rebuilds internal state on every add_trace call.
         rng2 = np.random.default_rng(RANDOM_STATE + 1)
-        fig = go.Figure()
+        all_x: list = []
+        all_y: list = []
+        all_colors: list = []
+        all_hover: list = []
         for fi in range(len(display_names) - 1, -1, -1):  # bottom to top
             shap_col = display_sv[:, fi]
             color_col = feat_norm[:, fi] if fi < feat_norm.shape[1] else np.zeros(len(shap_col))
             jitter = rng2.uniform(-0.35, 0.35, size=len(shap_col))
-            fig.add_trace(go.Scatter(
-                x=shap_col,
-                y=np.full(len(shap_col), fi) + jitter,
-                mode="markers",
-                marker=dict(
-                    color=color_col,
-                    colorscale="RdBu_r",
-                    cmin=0, cmax=1,
-                    size=4, opacity=0.7,
-                    colorbar=dict(
-                        title="Feature value<br>(low → high)",
-                        thickness=12, len=0.5,
-                        tickvals=[0, 1], ticktext=["Low", "High"],
-                    ) if fi == 0 else None,
-                    showscale=(fi == 0),
+            y_vals = (np.full(len(shap_col), fi) + jitter).tolist()
+            all_x.extend(shap_col.tolist() + [None])
+            all_y.extend(y_vals + [None])
+            all_colors.extend(color_col.tolist() + [0.0])
+            all_hover.extend([f"<b>{display_names[fi]}</b><br>SHAP: {v:.4f}<extra></extra>"
+                               for v in shap_col] + [None])
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=all_x,
+            y=all_y,
+            mode="markers",
+            marker=dict(
+                color=all_colors,
+                colorscale="RdBu_r",
+                cmin=0, cmax=1,
+                size=4, opacity=0.7,
+                colorbar=dict(
+                    title="Feature value<br>(low → high)",
+                    thickness=12, len=0.5,
+                    tickvals=[0, 1], ticktext=["Low", "High"],
                 ),
-                hovertemplate=f"<b>{display_names[fi]}</b><br>SHAP: %{{x:.4f}}<extra></extra>",
-                name=display_names[fi],
-                showlegend=False,
-            ))
+                showscale=True,
+            ),
+            hovertemplate="%{customdata}<extra></extra>",
+            customdata=all_hover,
+            showlegend=False,
+        ))
 
         fig.add_vline(x=0, line_dash="dash", line_color="gray", line_width=1)
         fig.update_layout(

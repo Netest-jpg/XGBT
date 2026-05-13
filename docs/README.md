@@ -26,7 +26,8 @@
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if you don't have it:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+curl -LsSf https://astral.sh/uv/install.sh | sh (MacOS/Linux)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex" (Windows) 
 ```
 
 Git clone and install:

@@ -189,12 +189,29 @@ def build_pipeline(
     ])
 
     transformers = []
-    if robust_in_num: transformers.append(("robust", robust_transformer, robust_in_num))
-    if pca_cols:      transformers.append(("num",    pca_transformer,    pca_cols))
-    if ohe_cat_cols:  transformers.append(("cat",    ohe_transformer,    ohe_cat_cols))
-    if te_cat_cols:   transformers.append(("te_cat", te_transformer,     te_cat_cols))
+    if robust_in_num:
+        transformers.append(("robust", robust_transformer, robust_in_num))
+    if pca_cols:
+        if use_pca:
+            # PCA is a joint decomposition — must keep all pca_cols in one branch
+            transformers.append(("num", pca_transformer, pca_cols))
+        else:
+            # No PCA: one branch per column so ColumnTransformer parallelises
+            # PowerTransformer fits across n_jobs workers (28 V-cols → 28 jobs)
+            def _col_pipe():
+                steps = [("imputer", SimpleImputer(strategy="median"))]
+                if POWER_TRANSFORM:
+                    steps.append(("power", PowerTransformer(method="yeo-johnson")))
+                return Pipeline(steps)
+            for col in pca_cols:
+                safe_name = f"num_{col}".replace("__", "_")
+                transformers.append((safe_name, _col_pipe(), [col]))
+    if ohe_cat_cols:
+        transformers.append(("cat",    ohe_transformer, ohe_cat_cols))
+    if te_cat_cols:
+        transformers.append(("te_cat", te_transformer,  te_cat_cols))
 
-    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop", n_jobs=-1)
 
     shared: dict[str, Any] = dict(
         n_estimators          = n_estimators,
@@ -496,14 +513,15 @@ def tune_hyperparameters(
     import time
 
     # ── Pre-fit preprocessor once ─────────────────────────────────────────────
-    log.info("  Pre-fitting preprocessor on X_train (once, loky backend)...")
+    log.info("  Pre-fitting preprocessor on X_train (once, parallel ColumnTransformer)...")
     _prep_pipe = build_pipeline(num_cols, ohe_cat_cols, te_cat_cols, task, metric, use_pca=use_pca)
     preprocessor = _prep_pipe.named_steps["preprocessor"]
-    with joblib.parallel_backend("loky", n_jobs=-1):
-        X_train_proc = _as_xgb_matrix(preprocessor.fit_transform(X_train, pd.Series(y_train).astype(float)))
-        X_val_proc   = _as_xgb_matrix(preprocessor.transform(X_val))
     y_train_arr = np.array(y_train)
     y_val_arr   = np.array(y_val)
+    X_train_f32 = X_train.astype(np.float32)
+    X_val_f32   = X_val.astype(np.float32)
+    X_train_proc = _as_xgb_matrix(preprocessor.fit_transform(X_train_f32, y_train_arr.astype(float)))
+    X_val_proc   = _as_xgb_matrix(preprocessor.transform(X_val_f32))
 
     n_rows = len(X_train_proc)
 

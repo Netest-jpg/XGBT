@@ -392,11 +392,11 @@ def main() -> None:
                 n_estimators=best_n, early_stop=0, use_pca=use_pca,
             )
             preprocessor  = refit_pipeline.named_steps["preprocessor"]
-            X_tv_proc     = preprocessor.fit_transform(X_trainval, y_trainval.astype(float))
-            X_val_proc    = preprocessor.transform(X_val)
-            X_test_proc   = preprocessor.transform(X_test)
+            X_tv_proc     = preprocessor.fit_transform(X_trainval.astype(np.float32), y_trainval.astype(float))
+            X_val_proc    = preprocessor.transform(X_val.astype(np.float32))
+            X_test_proc   = preprocessor.transform(X_test.astype(np.float32))
             _refit_cb     = _IterationLogCallback(period=CB_LOG_PERIOD, label="final")
-            refit_pipeline.named_steps["model"].set_params(callbacks=[_refit_cb])
+            refit_pipeline.named_steps["model"].set_params(nthread=-1, callbacks=[_refit_cb])
             refit_pipeline.named_steps["model"].fit(
                 X_tv_proc, y_trainval,
                 eval_set=[(X_val_proc, y_val)],
@@ -409,12 +409,12 @@ def main() -> None:
                 n_estimators=N_ESTIMATORS_MAX, early_stop=30, use_pca=use_pca,
             )
             preprocessor  = final_pipeline.named_steps["preprocessor"]
-            X_tv_proc     = preprocessor.fit_transform(X_trainval, y_trainval.astype(float))
-            X_val_proc    = preprocessor.transform(X_val)
-            X_test_proc   = preprocessor.transform(X_test)
+            X_tv_proc     = preprocessor.fit_transform(X_trainval.astype(np.float32), y_trainval.astype(float))
+            X_val_proc    = preprocessor.transform(X_val.astype(np.float32))
+            X_test_proc   = preprocessor.transform(X_test.astype(np.float32))
 
             _es_model = final_pipeline.named_steps["model"]
-            _es_model.set_params(callbacks=[_IterationLogCallback(period=CB_LOG_PERIOD, label="es-fit")])
+            _es_model.set_params(nthread=-1, callbacks=[_IterationLogCallback(period=CB_LOG_PERIOD, label="es-fit")])
             _es_model.fit(
                 X_tv_proc, y_trainval,
                 eval_set=[(X_val_proc, y_val)],
@@ -432,7 +432,7 @@ def main() -> None:
             refit_pipeline.steps[step_names.index("preprocessor")] = ("preprocessor", preprocessor)
             _refit_cb    = _IterationLogCallback(period=CB_LOG_PERIOD, label="refit")
             _refit_model = refit_pipeline.named_steps["model"]
-            _refit_model.set_params(callbacks=[_refit_cb])
+            _refit_model.set_params(nthread=-1, callbacks=[_refit_cb])
             _refit_model.fit(X_tv_proc, y_trainval, verbose=False)
             cb_history = _refit_cb.history
         final_pipeline = refit_pipeline
