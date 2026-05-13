@@ -231,7 +231,7 @@ drift_monitor:
 callback_log_period: 50     # log XGBoost boosting progress every N rounds
 
 diagnostics:
-  plots_enabled: true          # master switch; set true to enable all plots below
+  plots_enabled: false          # master switch; set true to enable all plots below
   optuna_plots: true            # hyperparameter importance + optimisation history
   learning_curve: true          # train vs. validation score vs. training size
   permutation_importance: true  # model-agnostic feature importance
