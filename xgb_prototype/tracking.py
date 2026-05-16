@@ -139,22 +139,6 @@ def _save_registry(records: list[dict], registry_file: Path) -> None:
     registry_file.write_text(json.dumps(records, indent=2, cls=_JSONEncoder))
 
 
-def _registry_status(metrics: dict, task: str) -> str:
-    """Decide production_ready / needs_review from eval metrics.
-
-    Rules (conservative defaults):
-      classification: ROC-AUC ≥ 0.80  AND  AUPRC ≥ 0.50  → production_ready
-      regression:     R² ≥ 0.70                            → production_ready
-      Otherwise → needs_review
-    """
-    if task == "regression":
-        return "production_ready" if metrics.get("r2", 0) >= 0.70 else "needs_review"
-    auc   = metrics.get("roc_auc", 0)
-    auprc = metrics.get("auprc",   0)
-    if auc >= 0.80 and auprc >= 0.50:
-        return "production_ready"
-    return "needs_review"
-
 
 def register_model(
     run_id: str,
@@ -176,7 +160,6 @@ def register_model(
     Each entry contains:
       run_id, timestamp, artifact path, eval metrics,
       best hyperparams, n_estimators, threshold,
-      status (production_ready | needs_review),
       task, and a copy of the config snapshot.
 
     The registry file is <output_dir>/model_registry.json.
@@ -184,14 +167,12 @@ def register_model(
     """
     registry_file = output_dir / "model_registry.json"
     records = _load_registry(registry_file)
-    status  = _registry_status(eval_metrics, task)
 
     entry = {
         "run_id":            f"{timestamp}_{run_id}",
         "timestamp":         timestamp,
         "artifact":          str(model_path),
         "task":              task,
-        "status":            status,
         "eval_metrics":      {k: round(float(v), 6) for k, v in eval_metrics.items()},
         "best_params":       best_params,
         "best_n_estimators": best_n,
@@ -204,10 +185,9 @@ def register_model(
     records.append(entry)
     _save_registry(records, registry_file)
 
-    emoji = "✓" if status == "production_ready" else "⚠"
     log.info(
-        "  [N6] Registry updated — %s %s  (%d total runs)  → %s",
-        emoji, status, len(records), registry_file,
+        "  [N6] Registry updated — %d total runs  → %s",
+        len(records), registry_file,
     )
 
 

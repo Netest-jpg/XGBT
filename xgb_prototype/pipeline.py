@@ -457,7 +457,16 @@ def tune_hyperparameters(
 
     # Subsample cap: fraction of rows capped at 50k to preserve fast-path intent
     _SUBSAMPLE_ROW_CAP = 50_000
-    n_sub = min(max(int(n_rows * SEARCH_SUBSAMPLE), 100), _SUBSAMPLE_ROW_CAP)
+    n_sub_requested = max(int(n_rows * SEARCH_SUBSAMPLE), 100)
+    n_sub = min(n_sub_requested, _SUBSAMPLE_ROW_CAP)
+    if n_sub < n_sub_requested:
+        log.warning(
+            "  search_subsample=%.2f requested %d rows (%.1f%%) but _SUBSAMPLE_ROW_CAP=%d "
+            "limits HPO to %d rows (%.1f%%). Set search_subsample to a smaller fraction or "
+            "raise _SUBSAMPLE_ROW_CAP if you need broader coverage.",
+            SEARCH_SUBSAMPLE, n_sub_requested, 100 * n_sub_requested / n_rows,
+            _SUBSAMPLE_ROW_CAP, n_sub, 100 * n_sub / n_rows,
+        )
     log.info("  Search subsample: %d / %d rows (%.1f%%)", n_sub, n_rows, 100 * n_sub / n_rows)
 
     search_summary: dict[str, Any] = {

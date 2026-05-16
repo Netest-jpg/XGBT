@@ -440,9 +440,15 @@ def main() -> None:
 
             # Phase A — train-only fit with honest val eval_set (for threshold tuning
             # and calibration; X_val has never been seen by this preprocessor fit).
+            # _power_transform=use_pca: PowerTransformer is only meaningful before PCA
+            # (scale-sensitive); XGBoost is split-based and invariant to monotonic
+            # feature transforms, so skip it when PCA is off. Matches tuning fast-path.
+            # _ct_n_jobs=1: avoids loky worker spawn overhead for the preprocessor fit;
+            # on a dense float matrix the parallelism cost exceeds the benefit.
             probe_pipeline = build_pipeline(
                 num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, final_params,
                 n_estimators=best_n, early_stop=0, use_pca=use_pca,
+                _power_transform=use_pca, _ct_n_jobs=1,
             )
             preprocessor  = probe_pipeline.named_steps["preprocessor"]
             X_train_proc  = preprocessor.fit_transform(X_train, y_train).astype(np.float32)
@@ -467,9 +473,11 @@ def main() -> None:
             # Preprocessor is refit on X_trainval so the final model's internal
             # feature transforms match the full training distribution, but we never
             # evaluate on val here — that would be leakage.
+            # Same _power_transform / _ct_n_jobs rationale as Phase A above.
             refit_pipeline = build_pipeline(
                 num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, final_params,
                 n_estimators=best_n, early_stop=0, use_pca=use_pca,
+                _power_transform=use_pca, _ct_n_jobs=1,
             )
             tv_preprocessor = refit_pipeline.named_steps["preprocessor"]
             X_tv_proc       = tv_preprocessor.fit_transform(X_trainval, y_trainval).astype(np.float32)
@@ -487,9 +495,11 @@ def main() -> None:
             # so we use X_train → X_val here (same honest-val fix as above).
 
             # Phase A — early-stopping probe on X_train only.
+            # _power_transform=use_pca / _ct_n_jobs=1: same rationale as TUNE_N_ESTIMATORS branch.
             probe_pipeline = build_pipeline(
                 num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, final_params,
                 n_estimators=N_ESTIMATORS_MAX, early_stop=30, use_pca=use_pca,
+                _power_transform=use_pca, _ct_n_jobs=1,
             )
             preprocessor  = probe_pipeline.named_steps["preprocessor"]
             X_train_proc  = preprocessor.fit_transform(X_train, y_train).astype(np.float32)
@@ -509,9 +519,11 @@ def main() -> None:
             X_val_proc_probe  = X_val_proc
             X_test_proc_probe = X_test_proc
             # Phase B — refit on train+val at confirmed best_n, no eval_set.
+            # _power_transform=use_pca / _ct_n_jobs=1: same rationale as TUNE_N_ESTIMATORS branch.
             refit_pipeline = build_pipeline(
                 num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, final_params,
                 n_estimators=best_n, early_stop=0, use_pca=use_pca,
+                _power_transform=use_pca, _ct_n_jobs=1,
             )
             tv_preprocessor = refit_pipeline.named_steps["preprocessor"]
             X_tv_proc       = tv_preprocessor.fit_transform(X_trainval, y_trainval).astype(np.float32)

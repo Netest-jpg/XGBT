@@ -138,7 +138,16 @@ def load_data() -> pd.DataFrame:
                 if ext == ".parquet":
                     return pl.read_parquet(p, parallel="row_groups").to_pandas()
                 if ext == ".csv" and CSV_CHUNK_SIZE is None:
-                    return pl.read_csv(p, low_memory=False).to_pandas()
+                    _last_pl_exc: Exception | None = None
+                    for _kwargs in (
+                        {"infer_schema_length": 50_000},  # fast: large sample
+                        {"infer_schema_length": 0},       # safe: full scan
+                    ):
+                        try:
+                            return pl.read_csv(p, low_memory=False, **_kwargs).to_pandas()
+                        except Exception as _exc:
+                            _last_pl_exc = _exc
+                    raise _last_pl_exc  # type: ignore[misc]
                 if ext in (".json", ".jsonl"):
                     return (pl.read_ndjson if ext == ".jsonl" else pl.read_json)(p).to_pandas()
                 if ext in (".xlsx", ".xls"):
@@ -447,7 +456,7 @@ def check_config(df: pd.DataFrame) -> None:
 
     range_checks = [
         (not (0.05 < TEST_SIZE <= 0.40),                    f"test_size={TEST_SIZE} outside (0.05, 0.40]"),
-        (CV_FOLDS != 0 and not (2 <= CV_FOLDS <= 20),       f"cv_folds={CV_FOLDS} outside [2, 20]"),
+        (CV_FOLDS != 0 and CV_FOLDS != -1 and not (2 <= CV_FOLDS <= 20), f"cv_folds={CV_FOLDS} outside [2, 20]"),
         (not (5 <= N_TRIALS <= 500),                        f"n_trials={N_TRIALS} outside [5, 500]"),
         (not (0.10 < SEARCH_SUBSAMPLE <= 1.0),              f"search_subsample={SEARCH_SUBSAMPLE} outside (0.10, 1.0]"),
         (not (50 <= N_ESTIMATORS_MAX <= 5000),              f"n_estimators_max={N_ESTIMATORS_MAX} outside [50, 5000]"),
