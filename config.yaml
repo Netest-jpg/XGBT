@@ -193,7 +193,7 @@ uncertainty:
 #  BASELINE COMPARISON
 # ─────────────────────────────────────────────
 baselines:
-  enabled: false
+  enabled: true
   include_dummy: true         # DummyClassifier / DummyRegressor
   include_linear: true        # LogisticRegression (classification) or Ridge (regression)
   include_default_xgb: true   # non-tuned XGBoost reference model

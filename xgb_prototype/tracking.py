@@ -21,8 +21,19 @@ if TYPE_CHECKING:
     from .data import DriftReport   # avoids circular import at runtime
 
 log = logging.getLogger(__name__)
-
-
+import numpy as np
+class _JSONEncoder(json.JSONEncoder):
+    """Handles numpy scalars/arrays and other non-serializable types."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        return super().default(obj)
 # ─────────────────────────────────────────────
 # UPGRADE 25 — MLflow experiment tracking
 # ─────────────────────────────────────────────
@@ -125,7 +136,7 @@ def _load_registry(registry_file: Path) -> list[dict]:
 
 
 def _save_registry(records: list[dict], registry_file: Path) -> None:
-    registry_file.write_text(json.dumps(records, indent=2))
+    registry_file.write_text(json.dumps(records, indent=2, cls=_JSONEncoder))
 
 
 def _registry_status(metrics: dict, task: str) -> str:
@@ -274,5 +285,5 @@ def train_summary(
         "artifact_paths":    artifact_paths or {},
     }
     report_path = output_dir / f"run_{timestamp}_{run_id}.json"
-    report_path.write_text(json.dumps(report, indent=2))
+    report_path.write_text(json.dumps(report, indent=2, cls=_JSONEncoder))
     log.info("  Run report saved → %s", report_path)

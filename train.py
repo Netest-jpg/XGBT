@@ -388,59 +388,110 @@ def main() -> None:
 
         final_params = dict(best_params)
 
+        # ── Phase A: fit on X_train only, with X_val as a true held-out eval_set.
+        # This is the only place where an eval_set is valid — val was never seen by
+        # this model, so the logged val metric is honest and can be used for both
+        # convergence monitoring and threshold tuning.
+        #
+        # Bug fixed: the previous code called preprocessor.fit_transform(X_trainval)
+        # and then passed X_val (a subset of X_trainval) as eval_set, causing the
+        # model to be trained on val and evaluated on val simultaneously, producing
+        # a spurious AUCPR=1.0000 from round 150 onward.
+
         if TUNE_N_ESTIMATORS:
             best_n = int(final_params.pop("n_estimators", N_ESTIMATORS_MAX))
+
+            # Phase A — train-only fit with honest val eval_set (for threshold tuning
+            # and calibration; X_val has never been seen by this preprocessor fit).
+            probe_pipeline = build_pipeline(
+                num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, final_params,
+                n_estimators=best_n, early_stop=0, use_pca=use_pca,
+            )
+            preprocessor  = probe_pipeline.named_steps["preprocessor"]
+            X_train_proc  = preprocessor.fit_transform(X_train, y_train).astype(np.float32)
+            X_val_proc    = preprocessor.transform(X_val).astype(np.float32)
+            X_test_proc   = preprocessor.transform(X_test).astype(np.float32)
+            _probe_cb     = _IterationLogCallback(period=CB_LOG_PERIOD, label="probe")
+            probe_pipeline.named_steps["model"].set_params(callbacks=[_probe_cb])
+            probe_pipeline.named_steps["model"].fit(
+                X_train_proc, y_train,
+                eval_set=[(X_train_proc, y_train), (X_val_proc, y_val)],
+                verbose=False,
+            )
+            cb_history = _probe_cb.history
+            # Preserve Phase A val/test transforms — these are the honest held-out
+            # versions (preprocessor fit on X_train only) used for threshold tuning
+            # and calibration downstream. Do NOT overwrite with tv_preprocessor transforms.
+            X_val_proc_probe  = X_val_proc
+            X_test_proc_probe = X_test_proc
+            log.info("  Phase A (probe) complete — val eval_set is honest.")
+
+            # Phase B — blind refit on train+val, fixed n_estimators, NO eval_set.
+            # Preprocessor is refit on X_trainval so the final model's internal
+            # feature transforms match the full training distribution, but we never
+            # evaluate on val here — that would be leakage.
             refit_pipeline = build_pipeline(
                 num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, final_params,
                 n_estimators=best_n, early_stop=0, use_pca=use_pca,
             )
-            preprocessor  = refit_pipeline.named_steps["preprocessor"]
-            X_tv_proc     = preprocessor.fit_transform(X_trainval, y_trainval).astype(np.float32)
-            X_val_proc    = preprocessor.transform(X_val).astype(np.float32)
-            X_test_proc   = preprocessor.transform(X_test).astype(np.float32)
-            _refit_cb     = _IterationLogCallback(period=CB_LOG_PERIOD, label="final")
+            tv_preprocessor = refit_pipeline.named_steps["preprocessor"]
+            X_tv_proc       = tv_preprocessor.fit_transform(X_trainval, y_trainval).astype(np.float32)
+            X_test_proc     = tv_preprocessor.transform(X_test).astype(np.float32)
+            _refit_cb       = _IterationLogCallback(period=CB_LOG_PERIOD, label="final")
             refit_pipeline.named_steps["model"].set_params(callbacks=[_refit_cb])
-            refit_pipeline.named_steps["model"].fit(
-                X_tv_proc, y_trainval,
-                eval_set=[(X_val_proc, y_val)],
-                verbose=False,
-            )
-            cb_history = _refit_cb.history
+            refit_pipeline.named_steps["model"].fit(X_tv_proc, y_trainval, verbose=False)
+            # Use Phase A val transform for threshold tuning and calibration (no leakage).
+            X_val_proc  = X_val_proc_probe
+            log.info("  Phase B (train+val refit) complete — no eval_set, fixed n_estimators=%d.", best_n)
+
         else:
-            final_pipeline = build_pipeline(
+            # TUNE_N_ESTIMATORS=false: use early stopping to find best_iteration,
+            # then refit at that depth. Early stopping requires a held-out eval_set,
+            # so we use X_train → X_val here (same honest-val fix as above).
+
+            # Phase A — early-stopping probe on X_train only.
+            probe_pipeline = build_pipeline(
                 num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, final_params,
                 n_estimators=N_ESTIMATORS_MAX, early_stop=30, use_pca=use_pca,
             )
-            preprocessor  = final_pipeline.named_steps["preprocessor"]
-            X_tv_proc     = preprocessor.fit_transform(X_trainval, y_trainval).astype(np.float32)
+            preprocessor  = probe_pipeline.named_steps["preprocessor"]
+            X_train_proc  = preprocessor.fit_transform(X_train, y_train).astype(np.float32)
             X_val_proc    = preprocessor.transform(X_val).astype(np.float32)
             X_test_proc   = preprocessor.transform(X_test).astype(np.float32)
-
-            _es_model = final_pipeline.named_steps["model"]
-            _es_model.set_params(callbacks=[_IterationLogCallback(period=CB_LOG_PERIOD, label="es-fit")])
+            _es_model = probe_pipeline.named_steps["model"]
+            _es_model.set_params(callbacks=[_IterationLogCallback(period=CB_LOG_PERIOD, label="es-probe")])
             _es_model.fit(
-                X_tv_proc, y_trainval,
-                eval_set=[(X_val_proc, y_val)],
+                X_train_proc, y_train,
+                eval_set=[(X_train_proc, y_train), (X_val_proc, y_val)],
                 verbose=False,
             )
-            best_n = final_pipeline.named_steps["model"].best_iteration
+            best_n = probe_pipeline.named_steps["model"].best_iteration
             log.info("  Early stopping → best n_estimators = %d (max was %d)", best_n, N_ESTIMATORS_MAX)
 
-            log.info("  Refitting final model at best_iteration=%d...", best_n)
+            # Preserve Phase A val/test transforms (preprocessor fit on X_train only).
+            X_val_proc_probe  = X_val_proc
+            X_test_proc_probe = X_test_proc
+            # Phase B — refit on train+val at confirmed best_n, no eval_set.
             refit_pipeline = build_pipeline(
                 num_cols, ohe_cat_cols, te_cat_cols, TASK, metric, final_params,
                 n_estimators=best_n, early_stop=0, use_pca=use_pca,
             )
-            step_names = [name for name, _ in refit_pipeline.steps]
-            refit_pipeline.steps[step_names.index("preprocessor")] = ("preprocessor", preprocessor)
+            tv_preprocessor = refit_pipeline.named_steps["preprocessor"]
+            X_tv_proc       = tv_preprocessor.fit_transform(X_trainval, y_trainval).astype(np.float32)
+            X_test_proc     = tv_preprocessor.transform(X_test).astype(np.float32)
+            log.info("  Refitting final model at best_iteration=%d (train+val, no eval_set)...", best_n)
             _refit_cb    = _IterationLogCallback(period=CB_LOG_PERIOD, label="refit")
-            _refit_model = refit_pipeline.named_steps["model"]
-            _refit_model.set_params(callbacks=[_refit_cb])
-            _refit_model.fit(X_tv_proc, y_trainval, verbose=False)
+            refit_pipeline.named_steps["model"].set_params(callbacks=[_refit_cb])
+            refit_pipeline.named_steps["model"].fit(X_tv_proc, y_trainval, verbose=False)
+            # Use Phase A val transform for threshold tuning and calibration (no leakage).
+            X_val_proc  = X_val_proc_probe
             cb_history = _refit_cb.history
+
         final_pipeline = refit_pipeline
 
         # ── 6b. Threshold tuning ─────────────────────────────────────────────
+        # X_val_proc here is the Phase A transform (preprocessor fit on X_train only),
+        # so val rows were never seen during preprocessing — truly held-out.
         log.info("[6b/9] Tuning decision threshold on val set...")
         best_threshold = tune_threshold(
             final_pipeline, X_val, y_val, metric, X_val_proc=X_val_proc

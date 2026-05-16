@@ -82,18 +82,18 @@ def _vectorized_scores(
     fp = preds[:, ~pos].sum(axis=1).astype(float)   # (C,)
     fn = (~preds[:, pos]).sum(axis=1).astype(float)  # (C,)
 
-    precision = np.where(tp + fp > 0, tp / (tp + fp), 0.0)
-    recall    = np.where(tp + fn > 0, tp / (tp + fn), 0.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        precision = np.where(tp + fp > 0, tp / (tp + fp), 0.0)
+        recall    = np.where(tp + fn > 0, tp / (tp + fn), 0.0)
 
-    denom_f1 = precision + recall
-    f1       = np.where(denom_f1 > 0, 2 * precision * recall / denom_f1, 0.0)
+        denom_f1 = precision + recall
+        f1       = np.where(denom_f1 > 0, 2 * precision * recall / denom_f1, 0.0)
 
-    denom_fb = beta ** 2 * precision + recall
-    fbeta    = np.where(denom_fb > 0, (1 + beta ** 2) * precision * recall / denom_fb, 0.0)
+        denom_fb = beta ** 2 * precision + recall
+        fbeta    = np.where(denom_fb > 0, (1 + beta ** 2) * precision * recall / denom_fb, 0.0)
 
     support = preds.sum(axis=1).astype(float)
     return precision, recall, f1, fbeta, support
-
 
 def _metrics_dict(
     precision: np.ndarray,
