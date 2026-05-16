@@ -26,11 +26,6 @@ Orchestrator only. All logic lives in xgb_prototype/:
 from __future__ import annotations
 import logging
 log = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.WARNING,
-    format='%(asctime)s [ %(levelname)s ]\t%(message)s',
-    force=True  # This is the "sledgehammer" that overrides other configs
-)
 logging.getLogger("great_expectations").setLevel(logging.WARNING)
 import uuid
 import warnings
@@ -312,6 +307,44 @@ def main() -> None:
         )
         log.info("")
 
+        # ── 3d. Act on drift (severity-tiered by p-value) ───────────────────
+        drifted_cols: set[str] = set()
+        if not DRIFT_WARN_ONLY:
+            # Tier by p-value magnitude, not just pass/fail at alpha.
+            # p < 0.01  → drop:         distribution too unreliable to train on
+            # p < alpha → flag only:    detectable shift but signal likely intact
+            DROP_THRESHOLD = 0.01
+            drop_cols  = {c: p for c, p in drift_report.pvalues_numerical.items() if p < DROP_THRESHOLD}
+            flag_cols  = {c: p for c, p in drift_report.pvalues_numerical.items()
+                  if DROP_THRESHOLD <= p < DRIFT_ALPHA}
+            drop_cols.update({c: p for c, p in drift_report.pvalues_categorical.items() if p < DROP_THRESHOLD})
+            flag_cols.update({c: p for c, p in drift_report.pvalues_categorical.items()
+                      if DROP_THRESHOLD <= p < DRIFT_ALPHA})
+
+            if drop_cols:
+                to_drop = [c for c in drop_cols if c in X_train.columns]
+                X_train      = X_train.drop(columns=to_drop)
+                X_val        = X_val.drop(columns=to_drop)
+                X_test       = X_test.drop(columns=to_drop)
+                num_cols     = [c for c in num_cols     if c not in drop_cols]
+                ohe_cat_cols = [c for c in ohe_cat_cols if c not in drop_cols]
+                te_cat_cols  = [c for c in te_cat_cols  if c not in drop_cols]
+                drifted_cols = set(drop_cols)
+                log.warning(
+                    "[3d/9] DROPPED %d severely drifted feature(s) (p < %.2f): %s",
+                    len(to_drop), DROP_THRESHOLD,
+                    {c: f"{p:.4f}" for c, p in drop_cols.items()},
+                )
+
+            if flag_cols:
+                log.warning(
+                    "[3d/9] FLAGGED %d mildly drifted feature(s) (%.2f ≤ p < %.2f), retained: %s",
+                    len(flag_cols), DROP_THRESHOLD, DRIFT_ALPHA,
+                    {c: f"{p:.4f}" for c, p in flag_cols.items()},
+                )
+                drifted_cols |= set(flag_cols)
+
+
         # ── 4. Feature engineering ───────────────────────────────────────────
         num_cols, ohe_cat_cols, te_cat_cols = filter_low_variance(
             X_train, num_cols, ohe_cat_cols, te_cat_cols
@@ -338,6 +371,10 @@ def main() -> None:
             "ohe_cat_cols": ohe_cat_cols,
             "te_cat_cols":  te_cat_cols,
             "use_pca":      use_pca,
+            "drifted_cols_dropped": sorted(drop_cols) if not DRIFT_WARN_ONLY else [],
+            "drifted_cols_flagged": sorted(flag_cols)  if not DRIFT_WARN_ONLY else
+                                    sorted(drift_report.drifted_numerical +
+                                            drift_report.drifted_categorical),
         }
 
         # ── Baselines ────────────────────────────────────────────────────────

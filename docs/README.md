@@ -1020,6 +1020,7 @@ The `ContinuousDriftMonitor` (separate from `detect_drift`) handles production-t
 
 The drift checks use vectorised `value_counts`/aligned distributions for categorical and label drift rather than scanning each category one by one, which matters on high-cardinality columns.
 
+Dropping columns at training time means PredictWrapper / ModelServer will also need to handle the case where a serving request includes the old columns. Since feature_schema now carries drifted_cols_flagged, inference code can silently drop them before passing to the pipeline — worth adding a note in inference.py if you ship this.
 ### Interaction features (`generate_feature_interactions`)
 
 Compute Pearson correlation on training data only → upper triangle of unique pairs → sort by |r| descending → select top-K with |r| ≥ 0.05 → add `A × B` features.

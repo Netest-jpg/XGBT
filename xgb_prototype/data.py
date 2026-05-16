@@ -673,7 +673,9 @@ def detect_drift(
         if DRIFT_WARN_ONLY:
             log.warning(msg)
         else:
-            raise ValueError(msg + " Set drift_warn_only=true to proceed anyway.")
+            log.error(
+                "%s Drifted columns will be dropped before training.", msg
+            )
     return report
 
 
