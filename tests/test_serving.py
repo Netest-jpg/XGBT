@@ -48,3 +48,17 @@ def test_model_server_rejects_missing_columns():
     with pytest.raises(ValueError, match="Missing required column"):
         server.predict(pd.DataFrame({"amount": [10.0]}))
 
+
+def test_model_server_ignores_training_dropped_drift_columns():
+    artifact = _artifact()
+    artifact["feature_schema"] = {"drifted_cols_dropped": ["legacy_score"]}
+    server = ModelServer(artifact)
+
+    response = server.predict(pd.DataFrame({
+        "amount": [10.0],
+        "merchant": ["a"],
+        "legacy_score": [999.0],
+    }))
+
+    assert response["predictions"] == [1]
+    assert "legacy_score" in response["warnings"][0]

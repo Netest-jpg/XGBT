@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from pathlib import Path
 
 
@@ -40,6 +41,13 @@ def _c(key: str, default):
         return OmegaConf.select(_cfg, key, default=default)
     except Exception:
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -115,7 +123,14 @@ OUTLIER_CONTAMINATION = float(_c("outlier_contamination", 0.05))
 PDP_TOP_N             = int(_c("pdp_top_n",               5))
 TARGET_LOG_TRANSFORM  = bool(_c("target_log_transform",   False))
 CB_LOG_PERIOD         = int(_c("callback_log_period",     50))
-USE_GPU               = bool(_c("use_gpu",                False))
+USE_GPU               = _env_bool("USE_GPU", bool(_c("use_gpu", False)))
+RASTER_FORMAT         = os.getenv("RASTER_FORMAT", str(_c("raster_format", "png"))).strip().lower()
+if RASTER_FORMAT not in {"png", "jpeg", "webp"}:
+    logging.getLogger(__name__).warning(
+        "Unsupported RASTER_FORMAT=%r; using png. Supported: png, jpeg, webp.",
+        RASTER_FORMAT,
+    )
+    RASTER_FORMAT = "png"
 PANDERA_VALIDATION    = bool(_c("pandera_validation",     True))
 METRIC_NAME           = str(_c("metric",                  "auto")).lower()
 CALIBRATION_ENABLED   = bool(_c("calibration_enabled",   True))

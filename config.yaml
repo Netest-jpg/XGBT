@@ -231,7 +231,7 @@ drift_monitor:
 callback_log_period: 50     # log XGBoost boosting progress every N rounds
 
 diagnostics:
-  plots_enabled: false          # master switch; set true to enable all plots below
+  plots_enabled: true          # master switch; set true to enable all plots below
   optuna_plots: true            # hyperparameter importance + optimisation history
   learning_curve: true          # train vs. validation score vs. training size
   permutation_importance: true  # model-agnostic feature importance
@@ -239,7 +239,7 @@ diagnostics:
   partial_dependence: true      # PDP + ICE for top-N features
   pca_plots: true               # explained variance and component projections
   outlier_report: true          # IsolationForest anomaly score distribution
-  shap: true                    # SHAP beeswarm (feature value vs. impact); requires shap>=0.46
+  shap: true                    # XGBoost-native SHAP summary + interactions
   calibration_curve: true       # reliability diagram: calibrated vs. raw XGBoost probabilities
   corr_heatmap: true            # Pearson correlation heatmap for numerical features
 

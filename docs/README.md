@@ -9,7 +9,7 @@
 1. [Project Overview](#1-project-overview)
 2. [Project Layout](#2-project-layout)
 3. [Quick Start](#3-quick-start)
-4. [Using This Template With a New CSV](#4-using-this-template-with-a-new-csv)
+4. [Short Training Guide](#4-short-training-guide)
 5. [config.yaml — Complete Reference](#5-configyaml--complete-reference)
 6. [Training Process — Step by Step](#6-training-process--step-by-step)
 7. [Package Modules (`xgb_prototype/`)](#7-package-modules-xgb_prototype)
@@ -87,7 +87,7 @@ The current sample dataset is `creditcard.csv`, but the code is intentionally no
 ├── config.yaml                  # Main runtime configuration
 ├── creditcard.csv               # Example tabular dataset
 ├── pyproject.toml               # Dependencies, dev extras, console script
-├── train.py                     # Backward-compatible launcher
+├── train.py                     # Main training orchestrator
 ├── uv.lock                      # Locked dependency resolution
 ├── docs/                        # Documentation files
 ├── xgb_prototype/
@@ -103,12 +103,12 @@ The current sample dataset is `creditcard.csv`, but the code is intentionally no
 │   ├── metrics.py               # MetricConfig and metric selection
 │   ├── pipeline.py              # sklearn Pipeline construction
 │   ├── plots.py                 # Diagnostic plot generation
-│   ├── serving.py               # Stable serving imports
+│   ├── _render.py               # Datashader/HoloViews/raster controller
 │   ├── settings.py              # Module-level config constants
 │   ├── thresholds.py            # Binary threshold tuning policies
 │   ├── tracking.py              # MLflow integration
 │   ├── uncertainty.py           # Conformal prediction + quantile intervals
-│   └── train.py                 # Main training orchestration
+│   └── train.py                 # Package entrypoint wrapper
 └── tests/
     ├── test_config.py
     ├── test_data_loading_and_temporal.py
@@ -124,7 +124,7 @@ Generated outputs go to:
 
 ```text
 models/     # Joblib artifacts, run JSON, registry, locks, CSVs
-plots/      # Plotly HTML and PNG diagnostics
+plots/      # Plotly, HoloViews, and raster diagnostics
 ```
 
 ---
@@ -141,6 +141,12 @@ Run training:
 
 ```bash
 uv run python train.py
+```
+
+Equivalent package entrypoint:
+
+```bash
+uv run python -m xgb_prototype.train
 ```
 
 Run the fast tests:
@@ -213,6 +219,7 @@ If logistic regression beats XGBoost: the relationship may be mostly linear, or 
 | Data path matched no files | Use an absolute path; verify glob pattern |
 | Too slow | Set `cv_folds: 0`, lower `n_trials`, disable diagnostics |
 | Memory issues | Disable PCA plots and permutation importance, lower `target_encoding_threshold` |
+| Stale plot extension | Re-run with the current code; correlation and outlier reports remove old PNG/JPEG/WebP variants when writing HTML |
 | Bad classification threshold | Try `threshold_policy.mode: f1` or `fbeta` |
 | Regression target skew | Try `target_log_transform: true` if target > 0 |
 
@@ -427,9 +434,21 @@ diagnostics:
   outlier_report: true
   partial_dependence: true
   pca_plots: true
+  shap: true
+  calibration_curve: true
+  corr_heatmap: true
 ```
 
 `plots_enabled` is a master switch. Individual families can also be toggled.
+
+Rendering controls:
+
+```bash
+RASTER_FORMAT=webp uv run python train.py   # png, jpeg, or webp
+USE_GPU=true uv run python train.py         # tries cuXfilter/RAPIDS, falls back safely
+```
+
+Large scatter/heatmap rendering is routed through `_render.py`. Correlation heatmaps and outlier reports are HoloViews HTML. SHAP summary/interactions and feature importance are raster outputs for speed.
 
 ### Threshold policy settings
 
@@ -558,7 +577,7 @@ Run command:
 uv run python train.py
 ```
 
-Both run the same `main()` function in `xgb_prototype/train.py`. The root `train.py` is a thin launcher for backward compatibility.
+The repo-root `train.py` is the main orchestrator. `python -m xgb_prototype.train` is a package wrapper around the same `main()` function, which keeps installed-package and subprocess smoke-test usage working.
 
 ### High-level pipeline
 
@@ -574,7 +593,7 @@ load_data()
                               └─ [optional: select_features_rfecv()]
                                   └─ evaluate_baselines()
                                       └─ tune_hyperparameters()  [Optuna]
-                                          └─ final fit + early stop + refit
+                                          └─ final fit / early-stop reuse
                                               └─ CalibratedClassifierCV
                                                   └─ tune_threshold()
                                                       └─ evaluate()
@@ -609,7 +628,7 @@ Data flows in one direction. Nothing downstream re-touches upstream data — thi
 | Optional RFECV | Lightweight XGBoost; expensive, off by default |
 | Baseline comparison | Dummy, logistic regression, default XGBoost |
 | Optuna tuning | TPE sampler, MedianPruner; CV or subsample mode |
-| Final fit | Fit with early stopping → record `best_n` → refit at exactly `best_n` |
+| Final fit | If `n_estimators` was tuned, fit once on `train+val`; if early stopping is active, reuse the fitted early-stopped probe |
 | Calibration | `CalibratedClassifierCV` on val set; handles sklearn 1.6 `FrozenEstimator` |
 | Threshold tuning | Quantile-candidate search on val set predictions |
 | Held-out evaluation | Test set used only here — never seen during tuning or calibration |
@@ -623,9 +642,9 @@ Data flows in one direction. Nothing downstream re-touches upstream data — thi
 
 **Three-way split:** The test set is held out completely and used only for final evaluation. The val set handles early stopping, calibration, and threshold tuning. If val influenced the threshold and was also used to report metrics, results would be optimistically biased.
 
-**Final fit refit:** With early stopping, XGBoost internally trains up to `N_ESTIMATORS_MAX` trees but only uses the best `best_n`. A refit at exactly `best_n` eliminates unused trees, shrinking the artifact and speeding up inference.
+**Final fit speed path:** When Optuna tunes `n_estimators`, final fitting uses one train+val fit with that exact tree count. When early stopping is used instead, the fitted early-stopped probe is kept as the final model. This removes the old duplicate probe/refit cycle; in the tuned-`n_estimators` path, you should not expect probe-round validation logs.
 
-**Preprocessor reuse:** The preprocessor is fitted on `train+val` before early stopping. The same fitted preprocessor is reused for the refit — no re-fitting happens, avoiding redundant computation and any possibility of val-set leakage into the preprocessor.
+**Preprocessor fitting:** In the tuned-`n_estimators` path, the final preprocessor is fitted once on `train+val`. In the early-stopping path, the preprocessor fitted for the probe stays paired with that fitted probe model so transforms and trees remain consistent.
 
 **`nthread=1` on XGBoost:** Prevents XGBoost from spawning its own thread pool inside each Optuna trial. Without this, trial-level and tree-level parallelism fight for threads and cause slowdowns.
 
@@ -706,19 +725,23 @@ print(result.retraining_recommended)
 print(result.recommendation)
 ```
 
-### `serving.py`
+### `inference.py`
 
-Stable public inference imports. Provides a fixed import path independent of internal refactoring.
+Stable inference wrappers. `PredictWrapper` is the thin local wrapper; `ModelServer` adds input validation and a JSON response envelope for API-style use.
 
 ```python
-from xgb_prototype.serving import PredictWrapper, ModelServer
+from xgb_prototype.inference import PredictWrapper, ModelServer
 ```
 
-### `train.py`
+### `_render.py`
 
-Main training orchestration. Contains `main()`, pipeline construction, Optuna tuning, evaluation, artifact writing, registry updates, and the `PredictWrapper` / `ModelServer` classes.
+Traffic controller for large diagnostics. `plots.py` calls `scatter_large()`, `scatter_large_html()`, `heatmap_large()`, or `heatmap_large_html()` and does not need to know whether Datashader, HoloViews, cuXfilter, or Matplotlib handled the render.
 
-Edit this file when changing the core training sequence, preprocessing, model construction, Optuna tuning, final artifact contents, or diagnostics.
+### Root `train.py`
+
+Main training orchestration. Contains `main()`, pipeline construction, Optuna tuning, evaluation, artifact writing, registry updates, and diagnostics scheduling.
+
+Edit this file when changing the core training sequence or final artifact contents. Prefer changing reusable behavior in package modules when possible.
 
 ---
 
@@ -730,7 +753,7 @@ The raw `pipeline.predict()` returns integer-encoded labels when a `LabelEncoder
 
 ```python
 import joblib
-from xgb_prototype.serving import PredictWrapper
+from xgb_prototype.inference import PredictWrapper
 
 artifact = joblib.load("models/model_<timestamp>_<run_id>.joblib")
 model = PredictWrapper(artifact)
@@ -747,7 +770,7 @@ custom = model.predict_with_threshold(new_df, threshold=0.3)
 
 ```python
 import joblib
-from xgb_prototype.serving import ModelServer
+from xgb_prototype.inference import ModelServer
 
 artifact = joblib.load("models/model_<timestamp>_<run_id>.joblib")
 server = ModelServer(artifact)
@@ -757,7 +780,7 @@ json_response = server.predict_json(new_df)
 metadata      = server.info()
 ```
 
-Input validation: coerces `dict` → `DataFrame`, checks for empty input, reports exactly which columns are missing (raises `ValueError`) or extra (warns and ignores). Missing required columns are always a bug; extra columns (audit fields, metadata) are common and harmless.
+Input validation: coerces `dict` → `DataFrame`, checks for empty input, reports exactly which columns are missing (raises `ValueError`) or extra (warns and ignores). Missing required columns are always a bug; extra columns (audit fields, metadata) are common and harmless. Columns dropped during training by drift policy are recognized from `feature_schema.drifted_cols_dropped` and ignored with a targeted warning.
 
 Response envelope:
 
@@ -791,7 +814,7 @@ The artifact is a Python dict:
 |-----|------|-------------|
 | `pipeline` | `sklearn.Pipeline` | Fitted preprocessor + model |
 | `best_params` | `dict` | Best Optuna hyperparameters |
-| `best_n_estimators` | `int` | Trees used after early stopping refit |
+| `best_n_estimators` | `int` | Trees selected by search or early stopping |
 | `best_threshold` | `float` | Tuned decision threshold |
 | `num_cols` | `list[str]` | Numerical column names |
 | `ohe_cat_cols` | `list[str]` | OHE-encoded categorical columns |
@@ -807,13 +830,13 @@ The artifact is a Python dict:
 | `drift_report` | `dict` | Train/test drift statistics |
 | `drift_monitor` | `ContinuousDriftMonitor\|None` | Production drift monitor |
 | `threshold_policy` | `dict` | Threshold policy config |
-| `feature_schema` | `dict` | Column lists + use_pca flag |
+| `feature_schema` | `dict` | Column lists, PCA flag, and drift dropped/flagged columns |
 | `artifact_paths` | `dict` | Paths to all saved files |
 | `config` | `dict` | Full config snapshot |
 | `run_id` | `str` | 8-character hex run identifier |
 | `timestamp` | `str` | `%Y%m%d_%H%M%S` |
 | `log_transformed` | `bool` | Whether target was log1p-transformed |
-| `cb_history` | `list[dict]` | Per-round train/val metrics |
+| `cb_history` | `list[dict]` | Per-round metrics when an eval-set probe was run; empty for the one-fit tuned-`n_estimators` path |
 
 ### Other output files
 
@@ -841,7 +864,7 @@ For binary classification, misclassified test samples are saved with columns: `t
 
 ## 10. Diagnostic Plots
 
-All plots are interactive Plotly HTML files in `plots/`, except `pca_2d.png` which is a static matplotlib PNG. Each HTML file embeds Plotly via CDN to keep file sizes small.
+Most plots are interactive Plotly HTML files in `plots/`. Large scatter/heatmap diagnostics use Datashader/HoloViews where useful; raster outputs use `RASTER_FORMAT` (`png`, `jpeg`, or `webp`; default `png`). If `USE_GPU=True`, cuXfilter is attempted first and silently falls back to Datashader when RAPIDS is unavailable.
 
 | Plot file | What it shows |
 |-----------|---------------|
@@ -849,21 +872,21 @@ All plots are interactive Plotly HTML files in `plots/`, except `pca_2d.png` whi
 | `roc_curve.html` | ROC curve with AUC |
 | `confusion_matrix.html` | Heatmap of TP/FP/TN/FN |
 | `residuals.html` | Predicted vs actual + residual distribution (regression) |
-| `feature_importance.html` | XGBoost gain importance, top 20 features |
+| `feature_importance.<raster>` | XGBoost gain importance, top 20 features |
 | `permutation_importance.html` | Model-agnostic permutation importance on test set |
 | `learning_curve.html` | Train vs val score as a function of training set size |
 | `threshold_sweep.html` | Precision, recall, F1 as a function of threshold |
 | `optuna_history.html` | Optuna optimization history |
 | `optuna_importance.html` | Hyperparameter importance from Optuna |
 | `pca_scree.html` | Explained variance per PCA component |
-| `pca_2d.png` | 2D scatter of first two PCs, colored by label |
+| `pca_2d.<raster>` | 2D scatter of first two PCs, colored by label |
 | `pca_3d.html` | Interactive 3D scatter of first three PCs (downsampled to 10,000 pts) |
 | `corr_heatmap.html` | Feature correlation matrix |
-| `shap_summary.html` | SHAP beeswarm plot |
-| `shap_interactions.html` | SHAP interaction values |
+| `shap_summary.<raster>` | SHAP beeswarm plot |
+| `shap_interactions.<raster>` | SHAP interaction values |
 | `calibration_curve.html` | Reliability diagram (calibrated vs uncalibrated) |
 | `outlier_report.html` | IsolationForest anomaly scores |
-| `pdp_*.html` | Partial dependence + ICE plots |
+| `pdp_all.html` | Partial dependence + ICE plots |
 
 ---
 
@@ -894,7 +917,7 @@ RUN_XGB_PROTOTYPE_SMOKE=1 uv run python -m pytest tests/test_smoke_training.py -
 
 **`test_feature_inference.py`** — float columns → numerical, low-cardinality integers → OHE categorical, object columns → categorical, imbalanced binary → AUPRC, `scale_pos_weight` computation. Tests `detect_feature_types` and `select_metric`.
 
-**`test_serving.py`** — `ModelServer` with a fake pipeline and minimal artifact dict; validates response envelope shape and that missing required columns raise `ValueError`.
+**`test_serving.py`** — `ModelServer` with a fake pipeline and minimal artifact dict; validates response envelope shape, missing-column errors, and ignored columns that were dropped during training by drift policy.
 
 **`test_smoke_training.py`** — end-to-end subprocess run on a tiny synthetic dataset with minimal config. Confirms the package entrypoint writes a `.joblib` artifact and a run JSON. Skipped by default because it launches an actual training run.
 
@@ -993,12 +1016,14 @@ MedianPruner with `n_warmup_steps=10`: terminates trials performing significantl
 
 Optuna itself runs one trial at a time by default because each trial may already use XGBoost threads or parallel CV folds. This avoids nested parallelism, which is often slower than it looks on paper.
 
-### Final fit / refit (`main` steps 6–6b)
+### Final fit (`main` steps 6–6b)
 
-1. Train on `train+val` with early stopping, using val as the eval set. Record `best_n`.
-2. Build a fresh pipeline with `n_estimators=best_n` and `early_stop=0`.
-3. Reuse the already-fitted preprocessor (no redundant fitting, no leakage).
-4. Refit on `train+val` at exactly `best_n` — eliminates unused trees, shrinks the artifact, speeds up inference.
+Two paths are used:
+
+1. If Optuna tuned `n_estimators`, fit once on `train+val` with the selected tree count and no eval set. This is the fastest path and intentionally produces no per-round validation callback history.
+2. If `n_estimators` is fixed and early stopping is active, fit an early-stopping probe on `train` with `val` as the eval set, record `best_n`, and keep that fitted probe as the final model to avoid a duplicate refit.
+
+The threshold and calibration steps still use the validation transform that matches the fitted model. This keeps the code general while avoiding the previous extra full XGBoost fit in step 6.
 
 ### Calibration (`CalibratedClassifierCV`)
 
@@ -1020,7 +1045,8 @@ The `ContinuousDriftMonitor` (separate from `detect_drift`) handles production-t
 
 The drift checks use vectorised `value_counts`/aligned distributions for categorical and label drift rather than scanning each category one by one, which matters on high-cardinality columns.
 
-Dropping columns at training time means PredictWrapper / ModelServer will also need to handle the case where a serving request includes the old columns. Since feature_schema now carries drifted_cols_flagged, inference code can silently drop them before passing to the pipeline — worth adding a note in inference.py if you ship this.
+If drift policy dropped columns during training, `PredictWrapper` and `ModelServer` recognize those names from `feature_schema.drifted_cols_dropped` and ignore them when they appear in serving payloads.
+
 ### Interaction features (`generate_feature_interactions`)
 
 Compute Pearson correlation on training data only → upper triangle of unique pairs → sort by |r| descending → select top-K with |r| ≥ 0.05 → add `A × B` features.
@@ -1061,9 +1087,9 @@ Soft fallback: if `use_gpu: true` but no GPU is detected, training falls back to
 
 **Pandera schema inferred from first run.** If the training data has errors (e.g. corrupted batch), those errors are baked into the schema. Ideal setup: infer once from a known-good reference batch and version it.
 
-**MLflow has no startup warning.** When `MLFLOW_URI` is set but MLflow initialization fails, tracking is silently skipped. A warning on startup would be safer.
+**MLflow failures are non-fatal.** Startup failures are warned and artifact logging failures are debug-level. This protects the training artifact, but strict tracking environments may want a fail-fast option.
 
-**SHAP requires version ≥ 0.50.0 for XGBoost ≥ 3.0.0.** XGBoost 3.x serializes base_score as a JSON list rather than a plain float. SHAP < 0.50.0 fails to parse this and raises could not convert string to float: '[4.9973604E-1]'. The pyproject.toml pins shap>=0.50.0 to prevent this silently breaking on fresh installs
+**SHAP plots use XGBoost native contributions.** This is much faster than Python SHAP for tree models, but it is XGBoost-specific. If another model family is added later, SHAP plotting will need a backend abstraction.
 
 ---
 

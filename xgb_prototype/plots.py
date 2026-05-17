@@ -2,22 +2,37 @@
 from __future__ import annotations
 
 import logging
+import warnings
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import xgboost as xgb
 from sklearn.ensemble import IsolationForest
-from sklearn.inspection import PartialDependenceDisplay, permutation_importance
-from sklearn.model_selection import StratifiedKFold, learning_curve
+from sklearn.inspection import partial_dependence, permutation_importance
+from sklearn.model_selection import StratifiedShuffleSplit, train_test_split
 from sklearn.pipeline import Pipeline
 
+from ._render import heatmap_large, heatmap_large_html, scatter_large, scatter_large_html
 from .settings import (
     OUTLIER_CONTAMINATION, PCA_VARIANCE, PDP_TOP_N,
-    PLOT_OUTPUT_DIR, RANDOM_STATE, TARGET_COL,
+    PLOT_OUTPUT_DIR, RANDOM_STATE, RASTER_FORMAT, TARGET_COL,
 )
 
 log = logging.getLogger(__name__)
+warnings.filterwarnings("ignore", message=".*scattermapbox.*", category=DeprecationWarning)
+
+
+def _remove_stale_plot_variants(stem: str, keep) -> None:
+    keep_path = PLOT_OUTPUT_DIR / keep if isinstance(keep, str) else keep
+    for suffix in (".html", ".png", ".jpg", ".jpeg", ".webp"):
+        path = PLOT_OUTPUT_DIR / f"{stem}{suffix}"
+        if path != keep_path and path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
 
 def plot_pr_curve(y_test: np.ndarray, y_proba: np.ndarray, threshold: float) -> None:
@@ -161,31 +176,40 @@ def plot_feature_importance(
     n_feat = min(len(feat_names), len(scores))
     imp_df = (pd.DataFrame({"feature": feat_names[:n_feat], "importance": scores[:n_feat]})
               .sort_values("importance", ascending=False).head(20))
-    sorted_df = imp_df.sort_values("importance").reset_index(drop=True)
-    coords    = list(range(len(sorted_df)))
-    # Numeric y-axis so tick labels travel with bars during zoom/pan.
-    fig = go.Figure(go.Bar(
-        x=sorted_df["importance"], y=coords, orientation="h",
-        marker=dict(color=sorted_df["importance"], colorscale="Blues", showscale=False),
-    ))
-    fig.update_layout(
-        title="Top 20 Feature Importances — XGBoost (gain)",
-        xaxis_title="Importance (gain)",
-        yaxis=dict(tickvals=coords, ticktext=sorted_df["feature"].tolist(),
-                   title="", fixedrange=False),
-        template="simple_white",
-    )
-    path = PLOT_OUTPUT_DIR / "feature_importance.html"
-    fig.write_html(str(path), include_plotlyjs="cdn")
+    sorted_df = imp_df.sort_values("importance", ascending=True).reset_index(drop=True)
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig_h = max(4.8, 0.32 * len(sorted_df) + 1.2)
+    fig, ax = plt.subplots(figsize=(8.8, fig_h))
+    ax.barh(sorted_df["feature"], sorted_df["importance"], color="#4477AA", alpha=0.88)
+    ax.set_title("Top 20 Feature Importances - XGBoost gain")
+    ax.set_xlabel("Gain importance")
+    ax.set_ylabel("")
+    ax.grid(axis="x", color="#D9D9D9", linewidth=0.8, alpha=0.8)
+    ax.set_axisbelow(True)
+    ax.spines[["top", "right"]].set_visible(False)
+    max_imp = float(sorted_df["importance"].max()) if len(sorted_df) else 0.0
+    if max_imp > 0:
+        ax.set_xlim(0, max_imp * 1.12)
+        for y_pos, val in enumerate(sorted_df["importance"]):
+            ax.text(val + max_imp * 0.015, y_pos, f"{val:.3f}", va="center", fontsize=8)
+    fig.tight_layout()
+    suffix = ".jpg" if RASTER_FORMAT == "jpeg" else f".{RASTER_FORMAT}"
+    path = PLOT_OUTPUT_DIR / f"feature_importance{suffix}"
+    save_kwargs = {"dpi": 140, "bbox_inches": "tight", "format": "jpeg" if RASTER_FORMAT == "jpeg" else RASTER_FORMAT}
+    if RASTER_FORMAT == "jpeg":
+        save_kwargs["facecolor"] = "white"
+    fig.savefig(str(path), **save_kwargs)
+    plt.close(fig)
     log.info("  Feature importance → %s", path)
 
 
 def plot_pca_diagnostics(
     pipeline: Pipeline, X_train: pd.DataFrame, y_train: pd.Series, task: str,
 ) -> None:
-    import matplotlib; matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
     num_pipe = pipeline.named_steps["preprocessor"].named_transformers_.get("num")
     if num_pipe is None or "pca" not in num_pipe.named_steps:
         return
@@ -214,24 +238,16 @@ def plot_pca_diagnostics(
     X_proc = preprocessor.transform(X_train)
     pc1, pc2 = X_proc[:, 0], X_proc[:, 1]
 
-    fig2, ax = plt.subplots(figsize=(7, 5))
-    if task == "regression":
-        sc = ax.scatter(pc1, pc2, c=y_train.values, cmap="viridis", alpha=0.65, s=18, linewidths=0)
-        plt.colorbar(sc, ax=ax).set_label(TARGET_COL, fontsize=9)
-    else:
-        import matplotlib
-        classes = np.unique(y_train.values)
-        palette = matplotlib.colormaps["tab10"].resampled(len(classes))
-        for idx, cls in enumerate(classes):
-            mask = y_train.values == cls
-            ax.scatter(pc1[mask], pc2[mask], color=palette(idx), alpha=0.65, s=18, linewidths=0, label=str(cls))
-        ax.legend(title="Class", fontsize=8, markerscale=1.5)
-    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
-    ax.set_title("PCA — first two principal components")
-    ax.spines[["top", "right"]].set_visible(False)
-    plt.tight_layout()
-    path2 = PLOT_OUTPUT_DIR / "pca_2d.png"
-    plt.savefig(str(path2), dpi=100, bbox_inches="tight"); plt.close()
+    path2 = scatter_large(
+        pc1, pc2,
+        color=y_train.values,
+        title="PCA - first two principal components",
+        x_label="PC1",
+        y_label="PC2",
+        output_name="pca_2d",
+        color_label=TARGET_COL if task == "regression" else "Class",
+        cmap="viridis",
+    )
     log.info("  PCA 2-D → %s", path2)
 
     if n_keep >= 3:
@@ -281,7 +297,12 @@ def plot_permutation_importance(
     task: str,
     X_test_proc: np.ndarray | None = None,
 ) -> None:
-    log.info("  Computing permutation importance (n_repeats=10)...")
+    n_rows = len(X_test_proc) if X_test_proc is not None else len(X_test)
+    n_features = (X_test_proc.shape[1] if X_test_proc is not None else X_test.shape[1])
+    n_repeats = 3 if n_rows * max(n_features, 1) > 100_000 else 5
+    max_samples = min(1.0, 5_000 / max(n_rows, 1))
+    log.info("  Computing permutation importance (n_repeats=%d, max_samples=%s)...",
+             n_repeats, f"{max_samples:.3f}" if max_samples < 1.0 else "all")
     scoring_map = {"roc_auc": "roc_auc", "auprc": "average_precision",
                    "macro_f1": "f1_macro", "weighted_f1": "f1_weighted", "r2": "r2"}
     scoring = scoring_map.get(metric.name, "r2")
@@ -289,7 +310,8 @@ def plot_permutation_importance(
     if X_test_proc is not None:
         result = permutation_importance(
             pipeline.named_steps["model"], X_test_proc, y_test,
-            scoring=scoring, n_repeats=10, random_state=RANDOM_STATE, n_jobs=-1,
+            scoring=scoring, n_repeats=n_repeats, random_state=RANDOM_STATE,
+            n_jobs=-1, max_samples=max_samples,
         )
         prep = pipeline.named_steps["preprocessor"]
         all_names: list[str] = []
@@ -310,7 +332,8 @@ def plot_permutation_importance(
     else:
         result = permutation_importance(
             pipeline, X_test, y_test,
-            scoring=scoring, n_repeats=10, random_state=RANDOM_STATE, n_jobs=-1,
+            scoring=scoring, n_repeats=n_repeats, random_state=RANDOM_STATE,
+            n_jobs=-1, max_samples=max_samples,
         )
         feat_names = list(X_test.columns)
 
@@ -340,41 +363,89 @@ def plot_learning_curve(
     y_trainval: pd.Series, metric, task: str,
     X_trainval_proc: np.ndarray | None = None,
 ) -> None:
-    log.info("  Computing learning curve (cv=3, 8 sizes)...")
+    log.info("  Computing fast learning curve (single holdout, native XGBoost)...")
     scoring_map = {"roc_auc": "roc_auc", "auprc": "average_precision",
                    "macro_f1": "f1_macro", "weighted_f1": "f1_weighted", "r2": "r2"}
     scoring = scoring_map.get(metric.name, "r2")
-    train_sizes_frac = np.logspace(np.log10(0.10), 0, num=8)
-    cv_lc = (StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
-             if task == "classification" else 3)
-
-    # If pre-processed data is provided, run learning_curve on just the model
-    # step to avoid re-running the preprocessor on every fold (same output,
-    # significantly faster).
-    if X_trainval_proc is not None:
-        estimator = pipeline.named_steps["model"]
-        X_lc = X_trainval_proc
-    else:
-        estimator = pipeline
-        X_lc = X_trainval
+    train_sizes_frac = np.array([0.10, 0.18, 0.32, 0.56, 1.0])
 
     try:
-        train_sizes, train_scores, val_scores = learning_curve(
-            estimator, X_lc, y_trainval,
-            train_sizes=train_sizes_frac, cv=cv_lc, scoring=scoring, n_jobs=-1, shuffle=False,
+        from .pipeline import _as_xgb_matrix, _score_booster, _xgb_model_params
+
+        y_arr = np.asarray(y_trainval)
+        if X_trainval_proc is None:
+            preprocessor = pipeline.named_steps["preprocessor"]
+            X_proc = _as_xgb_matrix(preprocessor.fit_transform(X_trainval, y_arr))
+        else:
+            X_proc = _as_xgb_matrix(X_trainval_proc)
+
+        _LC_ROW_CAP = 20_000
+        rng = np.random.default_rng(RANDOM_STATE)
+        if len(X_proc) > _LC_ROW_CAP:
+            if task == "classification":
+                keep = []
+                classes, counts = np.unique(y_arr, return_counts=True)
+                for cls, cnt in zip(classes, counts):
+                    cls_idx = np.where(y_arr == cls)[0]
+                    n_keep = max(1, int(round(_LC_ROW_CAP * cnt / len(y_arr))))
+                    keep.append(rng.choice(cls_idx, size=min(n_keep, len(cls_idx)), replace=False))
+                keep_idx = np.concatenate(keep)
+            else:
+                keep_idx = rng.choice(len(X_proc), size=_LC_ROW_CAP, replace=False)
+            X_proc, y_arr = X_proc[keep_idx], y_arr[keep_idx]
+
+        if task == "classification":
+            splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.25, random_state=RANDOM_STATE)
+            train_idx, val_idx = next(splitter.split(X_proc, y_arr))
+        else:
+            train_idx, val_idx = train_test_split(
+                np.arange(len(X_proc)), test_size=0.25, random_state=RANDOM_STATE
+            )
+        X_tr_all, y_tr_all = X_proc[train_idx], y_arr[train_idx]
+        X_val_lc, y_val_lc = X_proc[val_idx], y_arr[val_idx]
+
+        model = pipeline.named_steps["model"]
+        base_model = model.estimator if hasattr(model, "estimator") else model
+        params = base_model.get_xgb_params()
+        n_estimators = min(80, int(getattr(base_model, "n_estimators", 100) or 100))
+        xgb_params = _xgb_model_params(
+            task, metric, {**params, "nthread": 1},
+            n_classes=int(len(np.unique(y_arr))) if task == "classification" else None,
         )
+        dval = xgb.DMatrix(X_val_lc, label=y_val_lc)
+        train_sizes, tr_mean, vl_mean = [], [], []
+        for frac in train_sizes_frac:
+            n_take = max(20, int(round(len(X_tr_all) * frac)))
+            if task == "classification":
+                sub = []
+                classes, counts = np.unique(y_tr_all, return_counts=True)
+                for cls, cnt in zip(classes, counts):
+                    cls_idx = np.where(y_tr_all == cls)[0]
+                    cls_take = max(1, int(round(n_take * cnt / len(y_tr_all))))
+                    sub.append(rng.choice(cls_idx, size=min(cls_take, len(cls_idx)), replace=False))
+                idx = np.concatenate(sub)
+            else:
+                idx = rng.choice(len(X_tr_all), size=min(n_take, len(X_tr_all)), replace=False)
+            dtrain = xgb.DMatrix(X_tr_all[idx], label=y_tr_all[idx])
+            booster = xgb.train(
+                xgb_params, dtrain, num_boost_round=max(1, n_estimators),
+                evals=[(dval, "validation")], verbose_eval=False,
+            )
+            train_sizes.append(len(idx))
+            tr_mean.append(_score_booster(booster, dtrain, y_tr_all[idx], task, metric))
+            vl_mean.append(_score_booster(booster, dval, y_val_lc, task, metric))
+        train_sizes = np.asarray(train_sizes)
+        tr_mean = np.asarray(tr_mean)
+        vl_mean = np.asarray(vl_mean)
     except Exception as e:
         log.warning("  Learning curve failed (skipping): %s", e); return
 
-    tr_mean = train_scores.mean(axis=1); tr_std = train_scores.std(axis=1)
-    vl_mean = val_scores.mean(axis=1);  vl_std = val_scores.std(axis=1)
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=train_sizes.tolist(), y=tr_mean.tolist(), mode="lines+markers",
                              name="Train", line=dict(color="#4477AA", width=2),
-                             error_y=dict(type="data", array=tr_std.tolist(), visible=True)))
+                             ))
     fig.add_trace(go.Scatter(x=train_sizes.tolist(), y=vl_mean.tolist(), mode="lines+markers",
-                             name="Val (CV-3)", line=dict(color="#CC3333", width=2),
-                             error_y=dict(type="data", array=vl_std.tolist(), visible=True)))
+                             name="Val (holdout)", line=dict(color="#CC3333", width=2)))
     fig.update_layout(title=f"Learning Curve — {scoring}",
                       xaxis_title="Training set size", yaxis_title=scoring,
                       template="simple_white")
@@ -445,18 +516,20 @@ def plot_outlier_report(
     x_vals, y_vals = X_te_proc[:, 0], X_te_proc[:, 1]
     x_lbl = "PC1" if use_pca else (num_cols[0] if num_cols else "Feature 0")
     y_lbl = "PC2" if use_pca else (num_cols[1] if len(num_cols) > 1 else "Feature 1")
-    color_vals = ["Outlier" if o else "Normal" for o in is_out]
-    fig = px.scatter(x=x_vals, y=y_vals, color=color_vals,
-                     color_discrete_map={"Normal": "#4477AA", "Outlier": "#CC3333"},
-                     hover_data={"Anomaly Score": np.round(scores, 4)},
-                     labels={"x": x_lbl, "y": y_lbl, "color": "Status"},
-                     title=f"IsolationForest — {n_out} outliers flagged "
-                           f"(contamination={OUTLIER_CONTAMINATION:.2f})",
-                     opacity=0.55, template="simple_white")
-    fig.update_traces(marker=dict(size=5))
-    path = PLOT_OUTPUT_DIR / "outlier_report.html"
-    fig.write_html(str(path), include_plotlyjs="cdn")
+    color_vals = np.where(is_out, "Outlier", "Normal")
+    path = scatter_large_html(
+        x_vals, y_vals,
+        color=color_vals,
+        title=f"IsolationForest - {n_out} outliers flagged (contamination={OUTLIER_CONTAMINATION:.2f})",
+        x_label=x_lbl,
+        y_label=y_lbl,
+        output_name="outlier_report",
+        color_label="Status",
+        width=900,
+        height=620,
+    )
     log.info("  Outlier report → %s", path)
+    _remove_stale_plot_variants("outlier_report", path)
 
 
 def plot_partial_dependence(
@@ -495,42 +568,44 @@ def plot_partial_dependence(
     rng = np.random.default_rng(RANDOM_STATE)
     X_ice = X_proc[rng.choice(X_proc.shape[0], size=min(_MAX_ICE, X_proc.shape[0]), replace=False)]
 
-    import matplotlib; matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    # Compute all PDPs in one batched call. sklearn internally vectorises the
-    # grid evaluations across features, which is significantly faster than
-    # calling from_estimator once per feature in a Python loop.
     try:
+        from plotly.subplots import make_subplots
+
         n_cols = min(3, len(top_idx))
         n_rows = (len(top_idx) + n_cols - 1) // n_cols
-        fig_mpl, axes = plt.subplots(
-            n_rows, n_cols,
-            figsize=(7 * n_cols, 4 * n_rows),
-            squeeze=False,
+        fig = make_subplots(rows=n_rows, cols=n_cols, subplot_titles=top_names)
+        for pos, (fi, fname) in enumerate(zip(top_idx, top_names), start=1):
+            row = (pos - 1) // n_cols + 1
+            col = (pos - 1) % n_cols + 1
+            pd_result = partial_dependence(
+                base_model, X_ice, features=[int(fi)], kind="both",
+                grid_resolution=40,
+            )
+            grid = pd_result["grid_values"][0]
+            avg = np.asarray(pd_result["average"])[0].reshape(-1)
+            individual = np.asarray(pd_result["individual"])[0]
+            if individual.ndim == 3:
+                individual = individual[0]
+            for line in individual[: min(120, individual.shape[0])]:
+                fig.add_trace(go.Scatter(
+                    x=grid, y=line, mode="lines",
+                    line=dict(color="rgba(68,119,170,0.08)", width=0.7),
+                    hoverinfo="skip", showlegend=False,
+                ), row=row, col=col)
+            fig.add_trace(go.Scatter(
+                x=grid, y=avg, mode="lines", name=f"PDP - {fname}",
+                line=dict(color="#CC3333", width=2.5), showlegend=False,
+            ), row=row, col=col)
+            fig.update_xaxes(title_text=fname, row=row, col=col)
+            fig.update_yaxes(title_text="Partial dependence", row=row, col=col)
+        fig.update_layout(
+            title="PDP + ICE - top features",
+            template="simple_white",
+            height=max(420, 320 * n_rows),
         )
-        PartialDependenceDisplay.from_estimator(
-            base_model, X_ice,
-            features=[int(fi) for fi in top_idx],
-            feature_names=feat_names,
-            kind="both",
-            subsample=_MAX_ICE,
-            random_state=RANDOM_STATE,
-            ax=axes.ravel()[:len(top_idx)],
-            pd_line_kw={"color": "#CC3333", "linewidth": 2.5},
-            ice_lines_kw={"color": "#4477AA", "alpha": 0.06, "linewidth": 0.8},
-        )
-        # Hide any unused axes in the grid
-        for ax in axes.ravel()[len(top_idx):]:
-            ax.set_visible(False)
-        for ax, fname in zip(axes.ravel(), top_names):
-            ax.set_title(f"PDP + ICE — {fname}")
-            ax.spines[["top", "right"]].set_visible(False)
-        plt.tight_layout()
-        path_png = PLOT_OUTPUT_DIR / "pdp_all.png"
-        plt.savefig(str(path_png), dpi=150, bbox_inches="tight")
-        plt.close()
-        log.info("  PDP (all features) → %s", path_png)
+        path_html = PLOT_OUTPUT_DIR / "pdp_all.html"
+        fig.write_html(str(path_html), include_plotlyjs="cdn")
+        log.info("  PDP (all features) → %s", path_html)
     except Exception as e:
         log.warning("  PDP batch call failed (skipping): %s", e)
 
@@ -585,20 +660,13 @@ def plot_shap_summary(
     max_display: int = 20,
     max_samples: int = 2_000,
 ) -> None:
-    """SHAP beeswarm summary plot using TreeExplainer on the raw booster.
+    """SHAP beeswarm summary plot using XGBoost's native contribution path.
 
     Extracts the booster from inside the sklearn Pipeline (unwrapping any
-    CalibratedClassifierCV wrapper), runs SHAP on the preprocessed test
-    matrix, then saves an interactive Plotly HTML beeswarm.
+    CalibratedClassifierCV wrapper), computes contribution values on the
+    preprocessed test matrix, then saves a raster beeswarm.
     """
-    try:
-        import shap  # noqa: F401
-    except ImportError:
-        log.warning("  [shap] shap not installed — skipping SHAP plots. "
-                    "Install with: pip install shap")
-        return
-
-    log.info("  Computing SHAP values (TreeExplainer)...")
+    log.info("  Computing SHAP values (XGBoost pred_contribs)...")
     try:
         booster, base_model, feat_names = _extract_booster_and_feature_names(
             pipeline, num_cols, ohe_cat_cols, te_cat_cols, use_pca
@@ -613,19 +681,16 @@ def plot_shap_summary(
             idx = rng.choice(n, size=max_samples, replace=False)
             X_proc = X_proc[idx]
 
-        explainer = shap.TreeExplainer(booster)
-        shap_values = explainer(X_proc)
-
-        # For multiclass shap returns shape (n, features, classes) — take class-1 slice
-        sv = shap_values.values
+        sv = booster.predict(xgb.DMatrix(X_proc), pred_contribs=True)
         if sv.ndim == 3:
             sv = sv[:, :, 1]
+        if sv.shape[1] > X_proc.shape[1]:
+            sv = sv[:, :-1]  # drop bias term
 
         n_feat = min(len(feat_names), sv.shape[1])
         names_trimmed = feat_names[:n_feat]
         sv = sv[:, :n_feat]
 
-        # Build beeswarm data: one point per (sample, feature), jittered on y
         mean_abs = np.abs(sv).mean(axis=0)
         order = np.argsort(mean_abs)[::-1][:max_display]
         display_names = [names_trimmed[i] for i in order]
@@ -638,63 +703,34 @@ def plot_shap_summary(
         feat_range = np.where(feat_max - feat_min == 0, 1.0, feat_max - feat_min)
         feat_norm = (X_display - feat_min) / feat_range  # 0–1 per feature
 
-        # Build a single consolidated scatter trace using None separators between
-        # features. This is much faster than adding one trace per feature because
-        # Plotly rebuilds internal state on every add_trace call.
         rng2 = np.random.default_rng(RANDOM_STATE + 1)
-        all_x: list = []
-        all_y: list = []
-        all_colors: list = []
-        all_hover: list = []
+        all_x: list[float] = []
+        all_y: list[float] = []
+        all_colors: list[float] = []
         for fi in range(len(display_names) - 1, -1, -1):  # bottom to top
             shap_col = display_sv[:, fi]
             color_col = feat_norm[:, fi] if fi < feat_norm.shape[1] else np.zeros(len(shap_col))
             jitter = rng2.uniform(-0.35, 0.35, size=len(shap_col))
             y_vals = (np.full(len(shap_col), fi) + jitter).tolist()
-            all_x.extend(shap_col.tolist() + [None])
-            all_y.extend(y_vals + [None])
-            all_colors.extend(color_col.tolist() + [0.0])
-            all_hover.extend([f"<b>{display_names[fi]}</b><br>SHAP: {v:.4f}<extra></extra>"
-                               for v in shap_col] + [None])
+            all_x.extend(shap_col.tolist())
+            all_y.extend(y_vals)
+            all_colors.extend(color_col.tolist())
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=all_x,
-            y=all_y,
-            mode="markers",
-            marker=dict(
-                color=all_colors,
-                colorscale="RdBu_r",
-                cmin=0, cmax=1,
-                size=4, opacity=0.7,
-                colorbar=dict(
-                    title="Feature value<br>(low → high)",
-                    thickness=12, len=0.5,
-                    tickvals=[0, 1], ticktext=["Low", "High"],
-                ),
-                showscale=True,
-            ),
-            hovertemplate="%{customdata}<extra></extra>",
-            customdata=all_hover,
-            showlegend=False,
-        ))
-
-        fig.add_vline(x=0, line_dash="dash", line_color="gray", line_width=1)
-        fig.update_layout(
+        path = scatter_large(
+            all_x, all_y,
+            color=all_colors,
             title=f"SHAP Summary — top {len(display_names)} features "
-                  f"(n={X_proc.shape[0]:,}, TreeExplainer)",
-            xaxis_title="SHAP value (impact on model output)",
-            yaxis=dict(
-                tickvals=list(range(len(display_names))),
-                ticktext=display_names,
-                title="",
-                fixedrange=False,
-            ),
-            template="simple_white",
-            height=max(400, 30 * len(display_names)),
+                  f"(n={X_proc.shape[0]:,}, native contributions)",
+            x_label="SHAP value (impact on model output)",
+            y_label="",
+            output_name="shap_summary",
+            color_label="Feature value (low to high)",
+            y_tickvals=list(range(len(display_names))),
+            y_ticktext=display_names,
+            cmap="RdBu_r",
+            width=950,
+            height=max(440, 32 * len(display_names)),
         )
-        path = PLOT_OUTPUT_DIR / "shap_summary.html"
-        fig.write_html(str(path), include_plotlyjs="cdn")
         log.info("  SHAP summary → %s", path)
 
     except Exception as e:
@@ -717,12 +753,7 @@ def plot_shap_interactions(
     Interaction values are O(n² features) so we cap samples and features
     aggressively to keep runtime reasonable.
     """
-    try:
-        import shap  # noqa: F401
-    except ImportError:
-        return  # already warned in plot_shap_summary
-
-    log.info("  Computing SHAP interaction values (top-%d features, n≤%d)...", top_n, max_samples)
+    log.info("  Computing SHAP interaction values (native top-%d, n≤%d)...", top_n, max_samples)
     try:
         booster, _, feat_names = _extract_booster_and_feature_names(
             pipeline, num_cols, ohe_cat_cols, te_cat_cols, use_pca
@@ -736,15 +767,16 @@ def plot_shap_interactions(
             idx = rng.choice(n, size=max_samples, replace=False)
             X_proc = X_proc[idx]
 
-        explainer = shap.TreeExplainer(booster)
-        # shap_interaction_values shape: (n_samples, n_features, n_features)
-        interaction_values = explainer.shap_interaction_values(X_proc)
+        interaction_values = booster.predict(xgb.DMatrix(X_proc), pred_interactions=True)
 
-        # For multiclass it returns a list — take class-1
-        if isinstance(interaction_values, list):
-            interaction_values = interaction_values[1]
+        # Native multiclass shape is usually (n, classes, f+1, f+1); take class 1
+        # when available and drop the bias row/column.
+        if interaction_values.ndim == 4:
+            cls_idx = 1 if interaction_values.shape[1] > 1 else 0
+            interaction_values = interaction_values[:, cls_idx, :, :]
+        if interaction_values.shape[1] > X_proc.shape[1]:
+            interaction_values = interaction_values[:, :-1, :-1]
 
-        # Trim to available feature names
         n_feat = min(len(feat_names), interaction_values.shape[1])
         names_trimmed = feat_names[:n_feat]
         interaction_values = interaction_values[:, :n_feat, :n_feat]
@@ -756,24 +788,19 @@ def plot_shap_interactions(
 
         mat = np.abs(interaction_values[:, top_idx, :][:, :, top_idx]).mean(axis=0)
 
-        fig = go.Figure(go.Heatmap(
-            z=mat,
-            x=top_names,
-            y=top_names,
-            colorscale="Blues",
-            colorbar=dict(title="Mean |interaction|", thickness=14),
-            hovertemplate="<b>%{y} × %{x}</b><br>Mean |interaction|: %{z:.4f}<extra></extra>",
-        ))
-        fig.update_layout(
+        path = heatmap_large(
+            mat,
             title=f"SHAP Interaction Values — top {len(top_names)} features "
                   f"(n={X_proc.shape[0]:,})",
-            xaxis=dict(tickangle=-35, fixedrange=False),
-            yaxis=dict(autorange="reversed", fixedrange=False),
-            template="simple_white",
-            height=max(450, 35 * len(top_names)),
+            output_name="shap_interactions",
+            x_ticktext=top_names,
+            y_ticktext=top_names,
+            cmap="Blues",
+            value_label="Mean |interaction|",
+            show_grid=True,
+            width=max(620, 42 * len(top_names)),
+            height=max(520, 42 * len(top_names)),
         )
-        path = PLOT_OUTPUT_DIR / "shap_interactions.html"
-        fig.write_html(str(path), include_plotlyjs="cdn")
         log.info("  SHAP interactions → %s", path)
 
     except Exception as e:
@@ -892,36 +919,23 @@ def plot_correlation_heatmap(
         labels = corr.columns.tolist()
         z = corr.values
 
-        # Mask upper triangle so we don't double-display (set to None)
-        z_display = z.copy().astype(object)
-        for i in range(len(labels)):
-            for j in range(i + 1, len(labels)):
-                z_display[i, j] = None
+        z_display = z.copy().astype(float)
+        z_display[np.triu_indices_from(z_display, k=1)] = np.nan
 
-        fig = go.Figure(go.Heatmap(
-            z=z_display,
-            x=labels,
-            y=labels,
-            colorscale="RdBu_r",
-            zmid=0,
-            zmin=-1, zmax=1,
-            colorbar=dict(title="Pearson r", thickness=14),
-            hovertemplate="<b>%{y} × %{x}</b><br>r = %{z:.3f}<extra></extra>",
-            text=np.where(z_display == None, "", np.round(z_display.astype(float), 2)),  # noqa: E711
-            texttemplate="%{text}",
-            textfont=dict(size=9),
-        ))
-        fig.update_layout(
+        path = heatmap_large_html(
+            z_display,
             title=f"Feature Correlation Matrix ({len(labels)} numerical features)",
-            xaxis=dict(tickangle=-40, fixedrange=False),
-            yaxis=dict(autorange="reversed", fixedrange=False),
-            template="simple_white",
-            height=max(450, 28 * len(labels)),
-            width=max(500, 30 * len(labels)),
+            output_name="corr_heatmap",
+            x_ticktext=labels,
+            y_ticktext=labels,
+            cmap="RdBu_r",
+            center=0.0,
+            value_label="Pearson r",
+            width=max(600, 32 * len(labels)),
+            height=max(520, 32 * len(labels)),
         )
-        path = PLOT_OUTPUT_DIR / "corr_heatmap.html"
-        fig.write_html(str(path), include_plotlyjs="cdn")
         log.info("  Correlation heatmap → %s", path)
+        _remove_stale_plot_variants("corr_heatmap", path)
 
     except Exception as e:
         log.warning("  Correlation heatmap failed (skipping): %s", e)

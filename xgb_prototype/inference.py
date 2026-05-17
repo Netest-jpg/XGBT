@@ -45,6 +45,8 @@ class PredictWrapper:
         self._known_categories: dict[str, set] = artifact.get("known_categories", {})
         self._log_transformed: bool = artifact.get("log_transformed", False)
         self._drift_monitor = artifact.get("drift_monitor")
+        feature_schema = artifact.get("feature_schema", {}) or {}
+        self._drifted_cols_dropped = set(feature_schema.get("drifted_cols_dropped", []))
 
     def _warn_unseen(self, X: "pd.DataFrame") -> None:
         for col in self.cat_cols:
@@ -60,6 +62,7 @@ class PredictWrapper:
                 )
 
     def predict(self, X: "pd.DataFrame") -> np.ndarray:
+        X = self._drop_training_removed_cols(X)
         self._warn_unseen(X)
         raw = self.pipeline.predict(X)
         if self._log_transformed:
@@ -67,6 +70,7 @@ class PredictWrapper:
         return self.le.inverse_transform(raw.astype(int)) if self.le is not None else raw
 
     def predict_proba(self, X: "pd.DataFrame") -> np.ndarray:
+        X = self._drop_training_removed_cols(X)
         self._warn_unseen(X)
         return self.pipeline.predict_proba(X)
 
@@ -74,6 +78,7 @@ class PredictWrapper:
         self, X: "pd.DataFrame", threshold: float | None = None
     ) -> np.ndarray:
         """Apply a custom probability threshold (binary classification only)."""
+        X = self._drop_training_removed_cols(X)
         self._warn_unseen(X)
         t    = threshold if threshold is not None else self.threshold
         prob = self.pipeline.predict_proba(X)[:, 1]
@@ -89,6 +94,7 @@ class PredictWrapper:
         """Run the persisted drift monitor against an inference batch."""
         if self._drift_monitor is None:
             return {"checked": False, "reason": "artifact has no drift_monitor"}
+        X = self._drop_training_removed_cols(X)
         self._warn_unseen(X)
         predictions = self.pipeline.predict(X)
         proba = self.pipeline.predict_proba(X) if hasattr(self.pipeline, "predict_proba") else None
@@ -99,6 +105,12 @@ class PredictWrapper:
             prediction_proba=proba,
             segment_cols=segment_cols,
         ).to_dict()
+
+    def _drop_training_removed_cols(self, X: "pd.DataFrame") -> "pd.DataFrame":
+        if not self._drifted_cols_dropped:
+            return X
+        dropped = [c for c in self._drifted_cols_dropped if c in X.columns]
+        return X.drop(columns=dropped) if dropped else X
 
 
 # ─────────────────────────────────────────────
@@ -185,6 +197,8 @@ class ModelServer:
         self._eval_metrics = artifact.get("eval_metrics", {})
         self._log_tf       = artifact.get("log_transformed", False)
         self._drift_monitor = artifact.get("drift_monitor")
+        feature_schema = artifact.get("feature_schema", {}) or {}
+        self._drifted_cols_dropped = set(feature_schema.get("drifted_cols_dropped", []))
 
         # Expected feature columns (original, pre-preprocessor)
         num_cols     = artifact.get("num_cols", [])
@@ -324,6 +338,8 @@ class ModelServer:
 
             missing = expected_set - input_cols
             extra   = input_cols - expected_set
+            dropped_extra = sorted(extra & self._drifted_cols_dropped)
+            noisy_extra = sorted(extra - self._drifted_cols_dropped)
 
             if missing:
                 raise ValueError(
@@ -331,13 +347,21 @@ class ModelServer:
                     f"{sorted(missing)}.\n"
                     f"Expected features: {self._expected_cols}"
                 )
-            if extra:
+            if dropped_extra:
                 msg = (
-                    f"[ModelServer] Extra column(s) in input will be ignored: "
-                    f"{sorted(extra)}."
+                    f"[ModelServer] Column(s) dropped during training due to drift "
+                    f"will be ignored: {dropped_extra}."
                 )
                 log.warning(msg)
                 warnings.append(msg)
+            if noisy_extra:
+                msg = (
+                    f"[ModelServer] Extra column(s) in input will be ignored: "
+                    f"{noisy_extra}."
+                )
+                log.warning(msg)
+                warnings.append(msg)
+            if extra:
                 df = df[self._expected_cols]
 
         # ── 4. Unseen-category warnings (delegate to PredictWrapper) ──────

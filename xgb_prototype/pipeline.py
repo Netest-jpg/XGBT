@@ -18,7 +18,7 @@ from sklearn.decomposition import PCA
 from sklearn.ensemble import VotingClassifier, VotingRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import average_precision_score, mean_absolute_error, mean_squared_error, r2_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, TimeSeriesSplit
+from sklearn.model_selection import StratifiedKFold, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, PowerTransformer, RobustScaler, TargetEncoder
 from tqdm import tqdm
@@ -447,18 +447,18 @@ def tune_hyperparameters(
     # CV strategy: >0 forces on, 0 forces off, -1 = auto (use CV if n_rows < 50k)
     _CV_AUTO_THRESHOLD = 50_000
     use_cv = (n_rows < _CV_AUTO_THRESHOLD) if CV_FOLDS < 0 else bool(CV_FOLDS)
+    n_folds = CV_FOLDS if CV_FOLDS > 0 else 5
     if use_cv:
-        n_folds = CV_FOLDS if CV_FOLDS > 0 else 5
-        cv_splitter = (TimeSeriesSplit(n_splits=n_folds) if CV_STRATEGY == "timeseries"
-                       else StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE))
-        log.info("  CV enabled: %s, %d folds (n_rows=%d)", cv_splitter.__class__.__name__, n_folds, n_rows)
+        log.info("  CV enabled: %s, %d folds (n_rows=%d)",
+                 "TimeSeriesSplit" if CV_STRATEGY == "timeseries" else "StratifiedKFold",
+                 n_folds, n_rows)
     else:
         log.info("  CV disabled — fast-path subsample (n_rows=%d)", n_rows)
 
     # Subsample cap: fraction of rows capped at 50k to preserve fast-path intent
     _SUBSAMPLE_ROW_CAP = 50_000
     n_sub_requested = max(int(n_rows * SEARCH_SUBSAMPLE), 100)
-    n_sub = min(n_sub_requested, _SUBSAMPLE_ROW_CAP)
+    n_sub = min(n_sub_requested, _SUBSAMPLE_ROW_CAP, n_rows)
     if n_sub < n_sub_requested:
         log.warning(
             "  search_subsample=%.2f requested %d rows (%.1f%%) but _SUBSAMPLE_ROW_CAP=%d "
@@ -468,6 +468,43 @@ def tune_hyperparameters(
             _SUBSAMPLE_ROW_CAP, n_sub, 100 * n_sub / n_rows,
         )
     log.info("  Search subsample: %d / %d rows (%.1f%%)", n_sub, n_rows, 100 * n_sub / n_rows)
+
+    def _stratified_search_indices(seed: int) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        cls_indices = {cls: np.where(y_train_arr == cls)[0] for cls in np.unique(y_train_arr)}
+        counts = {
+            cls: min(len(idxs), max(1, int(round(n_sub * len(idxs) / n_rows))))
+            for cls, idxs in cls_indices.items()
+        }
+        return np.concatenate([
+            rng.choice(cls_indices[cls], size=counts[cls], replace=False)
+            for cls in cls_indices
+        ])
+
+    if use_cv:
+        if CV_STRATEGY == "timeseries":
+            search_idx = np.arange(max(0, n_rows - n_sub), n_rows)
+        elif task == "classification":
+            search_idx = _stratified_search_indices(RANDOM_STATE)
+        else:
+            search_idx = np.random.default_rng(RANDOM_STATE).choice(n_rows, size=n_sub, replace=False)
+        X_search_proc = X_train_proc[search_idx]
+        y_search_arr = y_train_arr[search_idx]
+        if task == "classification" and CV_STRATEGY != "timeseries":
+            min_class_count = min(np.unique(y_search_arr, return_counts=True)[1])
+            if min_class_count < 2:
+                log.info("  CV disabled — class support in the search subsample is too small.")
+                use_cv = False
+                X_search_proc, y_search_arr = X_train_proc, y_train_arr
+            elif min_class_count < n_folds:
+                n_folds = int(min_class_count)
+                log.info("  CV folds reduced to %d because of class support in the search subsample.", n_folds)
+        if use_cv:
+            cv_splitter = (TimeSeriesSplit(n_splits=n_folds) if CV_STRATEGY == "timeseries"
+                           else StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE))
+            log.info("  CV search matrix: %d / %d rows (precomputed DMatrix folds)", len(X_search_proc), n_rows)
+    else:
+        X_search_proc, y_search_arr = X_train_proc, y_train_arr
 
     search_summary: dict[str, Any] = {
         "backend": SEARCH_BACKEND,
@@ -514,6 +551,8 @@ def tune_hyperparameters(
         effective_n_trials = N_TRIALS
         log.info("  Budget: n_trials=%d, timeout=none", effective_n_trials)
 
+    _n_est_low, _n_est_high = sorted((int(N_ESTIMATORS_MIN), int(N_ESTIMATORS_MAX)))
+
     # ── Objective ─────────────────────────────────────────────────────────────
     def objective(trial: optuna.Trial) -> float:
         if WIDE_SEARCH:
@@ -538,7 +577,7 @@ def tune_hyperparameters(
             }
 
         if TUNE_N_ESTIMATORS:
-            trial_n_est   = trial.suggest_int("n_estimators", N_ESTIMATORS_MIN, N_ESTIMATORS_MAX)
+            trial_n_est   = trial.suggest_int("n_estimators", _n_est_low, _n_est_high)
             trial_early_stop = None
         else:
             trial_n_est      = N_ESTIMATORS_MAX
@@ -550,19 +589,19 @@ def tune_hyperparameters(
                                                    n_classes=_n_classes_cv)
             _trial_early_stop = int(trial_early_stop) if trial_early_stop else None
 
-            def _fit_fold_np(X_tr_f, X_vl_f, y_tr_f, y_vl_f):
+            def _fit_fold_dmatrix(dtrain_f, dval_f, y_vl_f):
                 fit_kw: dict = {"verbose_eval": False}
                 if _trial_early_stop:
                     fit_kw["early_stopping_rounds"] = _trial_early_stop
-                booster = xgb.train(_trial_xgb_params, xgb.DMatrix(X_tr_f, label=y_tr_f),
+                booster = xgb.train(_trial_xgb_params, dtrain_f,
                                     num_boost_round=max(1, int(trial_n_est)),
-                                    evals=[(xgb.DMatrix(X_vl_f, label=y_vl_f), "validation")],
+                                    evals=[(dval_f, "validation")],
                                     **fit_kw)
-                return _score_booster(booster, xgb.DMatrix(X_vl_f, label=y_vl_f), y_vl_f, task, metric)
+                return _score_booster(booster, dval_f, y_vl_f, task, metric)
 
-            fold_scores = joblib.Parallel(n_jobs=-1, backend="loky")(
-                joblib.delayed(_fit_fold_np)(X_tr_f, X_vl_f, y_tr_f, y_vl_f)
-                for X_tr_f, X_vl_f, y_tr_f, y_vl_f in _cv_fold_arrays
+            fold_scores = joblib.Parallel(n_jobs=min(n_folds, joblib.cpu_count()), prefer="threads")(
+                joblib.delayed(_fit_fold_dmatrix)(dtrain_f, dval_f, y_vl_f)
+                for dtrain_f, dval_f, y_vl_f in _cv_fold_mats
             )
             trial.report(float(np.mean(fold_scores)), step=n_folds - 1)
             if trial.should_prune():
@@ -571,9 +610,7 @@ def tune_hyperparameters(
 
         # Fast-path: stratified subsample, reuse precomputed _dval_search
         if task == "classification":
-            rng = np.random.default_rng(trial.number)
-            idx = np.concatenate([rng.choice(cls_idx, size=_class_counts[cls], replace=False)
-                                  for cls, cls_idx in _class_indices.items()])
+            idx = _stratified_trial_indices[trial.number % len(_stratified_trial_indices)]
         else:
             idx = np.random.default_rng(trial.number).choice(n_rows, size=n_sub, replace=False)
 
@@ -598,21 +635,33 @@ def tune_hyperparameters(
 
     if task == "classification" and not use_cv:
         _class_indices = {cls: np.where(y_train_arr == cls)[0] for cls in np.unique(y_train_arr)}
-        _class_counts  = {cls: max(1, int(round(n_sub * len(idxs) / n_rows)))
+        _class_counts  = {cls: min(len(idxs), max(1, int(round(n_sub * len(idxs) / n_rows))))
                           for cls, idxs in _class_indices.items()}
+        _stratified_trial_indices = [
+            np.concatenate([
+                np.random.default_rng(seed).choice(_class_indices[cls], size=_class_counts[cls], replace=False)
+                for cls in _class_indices
+            ])
+            for seed in range(max(int(effective_n_trials), 1))
+        ]
     else:
         _class_indices, _class_counts = {}, {}
+        _stratified_trial_indices = []
 
-    # Precompute CV numpy slices once (contiguous copies — DMatrix built per-worker to avoid IPC cost)
+    # Precompute CV DMatrix folds once. Reusing them avoids per-trial array
+    # slicing, IPC serialization, and DMatrix construction overhead.
     if use_cv:
-        _cv_fold_arrays = [
-            (np.ascontiguousarray(X_train_proc[tr]), np.ascontiguousarray(X_train_proc[vl]),
-             y_train_arr[tr], y_train_arr[vl])
-            for tr, vl in cv_splitter.split(X_train_proc, y_train_arr)
+        _cv_fold_mats = [
+            (
+                xgb.DMatrix(np.ascontiguousarray(X_search_proc[tr]), label=y_search_arr[tr]),
+                xgb.DMatrix(np.ascontiguousarray(X_search_proc[vl]), label=y_search_arr[vl]),
+                y_search_arr[vl],
+            )
+            for tr, vl in cv_splitter.split(X_search_proc, y_search_arr)
         ]
-        _n_classes_cv = int(len(np.unique(y_train_arr))) if task == "classification" else None
+        _n_classes_cv = int(len(np.unique(y_search_arr))) if task == "classification" else None
     else:
-        _cv_fold_arrays, _n_classes_cv = [], None
+        _cv_fold_mats, _n_classes_cv = [], None
 
     # Run study
     study = optuna.create_study(
@@ -620,7 +669,7 @@ def tune_hyperparameters(
         sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE, n_startup_trials=10),
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=10),
     )
-    _nest_label = (f"tuned({N_ESTIMATORS_MIN}–{N_ESTIMATORS_MAX})" if TUNE_N_ESTIMATORS
+    _nest_label = (f"tuned({_n_est_low}–{_n_est_high})" if TUNE_N_ESTIMATORS
                    else f"fixed@{N_ESTIMATORS_MAX}+earlystop")
     log.info("[5/9] Optuna search [ Trials : %d | Timeout : %s | Subsample rows : %d | "
              "Metric : %s | CV : %s | Wide : %s | n_estimators : %s | Parallel folds : %s ]...",
